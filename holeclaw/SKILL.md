@@ -1,0 +1,103 @@
+---
+name: holeclaw
+description: HoleClaw performs rate-limited, sequential, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子" or "树洞高评论日报".
+---
+
+# HoleClaw
+
+Use the bundled browser collector and renderer. Keep the workflow read-only and never request the user's password, QR token, authorization header, cookie, or other login secret in chat.
+
+## Interpret parameters
+
+- Accept `近 N 天` as `--days N`.
+- Accept an explicit inclusive local date range as `--since YYYY-MM-DD --until YYYY-MM-DD`.
+- Accept `评论数大于 N` as `--min-comments N`. The comparison is strictly `reply > N`.
+- Default to `--days 30 --min-comments 50` only when the user omits a value.
+- Reject non-positive days, negative thresholds, an end before a start, and future-only ranges.
+- Warn before scanning a range older than 90 days or a past range far behind the current feed; the API is newest-first and must traverse intervening posts.
+
+## Run the workflow
+
+Set the skill path from the current skill location:
+
+```bash
+SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/holeclaw"
+```
+
+### 1. Establish login when needed
+
+Open a visible browser:
+
+```bash
+python3 "$SKILL_DIR/scripts/run_digest.py" login-open
+```
+
+Ask the user to complete PKU authentication in the visible browser. Pause until the user confirms that the Treehole home page is visible. Then save the local state:
+
+```bash
+python3 "$SKILL_DIR/scripts/run_digest.py" login-save
+```
+
+The default state path is `.auth/pku-treehole.json`. The script sets mode `0600` and adds `.auth/` to the current workspace `.gitignore`. Do not print or inspect the state contents.
+Normal collection runs load this state but do not save it again. Persist authentication only through the explicit `login-save` command, after login or when the session must be refreshed.
+
+### 2. Collect and render
+
+Examples:
+
+```bash
+# Rolling time window
+python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-comments 100
+
+# Inclusive local calendar range
+python3 "$SKILL_DIR/scripts/run_digest.py" run \
+  --since 2026-07-01 --until 2026-07-31 --min-comments 80
+
+# Long range with resumable checkpoints
+python3 "$SKILL_DIR/scripts/run_digest.py" run \
+  --days 365 --min-comments 100 \
+  --checkpoint-pages 500 --max-total-pages 2000
+```
+
+Use `--output PATH` only when the user specifies an output location. Otherwise write under `reports/` in the current workspace.
+
+Use one persistent browser collector for the whole run. It performs list parsing and time/comment filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint.
+
+The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.
+
+Write the visible checkpoint every `--checkpoint-pages` pages; the default and maximum are 500 pages. SQLite/WAL cache chunks are committed more frequently, and an error flushes the latest durable progress before exit. Re-run the exact same command to resume from `next_page`; a rolling window keeps its first start and end timestamps frozen.
+
+Store checkpoints under `output/playwright/holeclaw-checkpoints/` and the shared cache at `output/playwright/holeclaw-cache.sqlite3`, both with mode `0600`. The cache is independent of the report threshold: reuse complete coverage for different thresholds or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
+
+### 3. Handle authentication expiry
+
+If `run` reports that the page returned to `iaaa.pku.edu.cn`, repeat `login-open`, pause for the user's login, then run `login-save` and retry. Never attempt to fill the account or password fields.
+
+## Request-safety rules
+
+- Keep the bundled fixed page size and 0.6–2 second jitter; do not lower the delay.
+- Keep the checkpoint interval at or below 500 pages and the default total safety ceiling at 2,000 pages.
+- Keep one persistent collector process and send no concurrent Treehole requests.
+- Keep progress/completion event-driven through the localhost sink; never poll with extra Playwright CLI calls.
+- Filter requested matches inside the browser request process; send cache chunks only to the tokenized `127.0.0.1` sink.
+- Save accumulated PIDs, counts, and `next_page` atomically at checkpoint boundaries and on errors.
+- Store all list rows in SQLite/WAL so later thresholds and covered time ranges can be rendered without rescanning.
+- Send requests sequentially with no concurrency.
+- Stop as soon as the collector crosses the requested start time.
+- Honor `Retry-After`; back off on transient fetch/network errors and 429/5xx, then stop after three failed attempts.
+- Do not mass-fetch detail endpoints when list responses already contain the full post text and reply count. Fetch details only when required data is missing.
+- Do not like, follow, comment, publish, or modify account state.
+- Do not auto-save browser authentication after scans; use `login-save` only after an intentional login refresh.
+
+## Verify the result
+
+After the script completes, check:
+
+- `reached_start` is true.
+- SQLite `PRAGMA integrity_check` returns `ok` after a network run.
+- Every entry has `reply > min_comments`.
+- PIDs are unique.
+- Entries fall inside the requested time window.
+- The report contains a treehole number and a one-line content summary for every entry.
+
+Return a clickable path to the Markdown report plus scanned-page, scanned-post, and matched-post counts. Mention that comment counts are a scan-time snapshot and that image posts summarize captions only unless the user explicitly requests image analysis.

@@ -1,0 +1,62 @@
+# Authentication and browser state
+.auth/
+**/.auth/
+playwright/.auth/
+**/playwright/.auth/
+*storage-state*.json
+*pku-treehole*.json
+
+# Environment variables, credentials, and local configuration
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+*.pem
+*.key
+*.p12
+*.pfx
+config.local.*
+*.local
+*.local.*
+.codex/
+
+# HoleClaw runtime data and generated reports
+output/
+**/output/
+reports/
+**/reports/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.pid
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node and Playwright artifacts
+node_modules/
+playwright-report/
+test-results/
+blob-report/
+traces/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
