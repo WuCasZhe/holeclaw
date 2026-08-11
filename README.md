@@ -29,11 +29,9 @@ HoleClaw 是一个树洞爬虫 Skill，它按时间范围和评论数阈值顺�
 
 ## 安装
 ```bash
-git clone https://github.com/WuCasZhe/holeclaw.git
-cd holeclaw
 HOLECLAW_SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$HOLECLAW_SKILLS_DIR"
-cp -R holeclaw-repo/holeclaw "$HOLECLAW_SKILLS_DIR/holeclaw"
+git clone https://github.com/WuCasZhe/holeclaw.git "$HOLECLAW_SKILLS_DIR/holeclaw"
 ```
 
 
