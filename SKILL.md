@@ -70,6 +70,21 @@ python3 "$SKILL_DIR/scripts/run_digest.py" run \
 
 Use `--output PATH` only when the user specifies an output location. Otherwise write under `reports/` in the current workspace.
 
+### Standalone Playwright automation without AI
+
+When the user wants HoleClaw to run without Codex or AI assistance, use the bundled standalone entry point:
+
+```bash
+python3 "$SKILL_DIR/scripts/run_digest.py" standalone \
+  --days 7 --min-favorites 50
+```
+
+The repository bundles `scripts/playwright_cli.sh`, so standalone mode does not depend on the separate Codex Playwright skill. It still requires Python 3.10+, Node.js/npm (`npx`), and a supported local browser. It makes no LLM or AI API calls; one-line report summaries are deterministic text cleanup and truncation.
+
+If the saved state is missing or expired, standalone mode opens a headed browser and pauses once. The user must personally complete PKU authentication, navigate to the Treehole home page, and press Enter in the terminal. The script then saves the local state and continues automatically. Never fill credentials or bypass authentication.
+
+For cron/systemd after the initial interactive login, add `--non-interactive`. This uses a headless browser and makes missing or expired login state fail immediately instead of waiting on stdin. Always use a stable working directory or explicit `--state`, `--cache`, `--checkpoint`, and `--output` paths so scheduled runs reuse the intended state and cache. Global `--state` and `--session` options must appear before the `standalone` subcommand.
+
 Use one persistent browser collector for the whole run. It performs list parsing and time/comment/favorite filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint.
 
 The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.

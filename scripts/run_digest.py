@@ -36,9 +36,13 @@ def codex_base() -> Path:
 
 def find_pwcli() -> Path:
     override = os.environ.get("PWCLI")
-    path = Path(override) if override else codex_base() / "skills/playwright/scripts/playwright_cli.sh"
-    if not path.is_file():
-        raise CliError(f"Playwright wrapper not found: {path}")
+    local_wrapper = Path(__file__).with_name("playwright_cli.sh")
+    codex_wrapper = codex_base() / "skills/playwright/scripts/playwright_cli.sh"
+    candidates = [Path(override)] if override else [local_wrapper, codex_wrapper]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        checked = ", ".join(str(candidate) for candidate in candidates)
+        raise CliError(f"Playwright wrapper not found. Checked: {checked}")
     if subprocess.run(["bash", "-lc", "command -v npx >/dev/null 2>&1"]).returncode != 0:
         raise CliError("npx is required. Install Node.js/npm first.")
     return path
@@ -54,9 +58,10 @@ def native_path(path: Path) -> str:
 
 
 class BrowserCli:
-    def __init__(self, session: str):
+    def __init__(self, session: str, headed: bool = True):
         self.pwcli = find_pwcli()
         self.session = session
+        self.headed = headed
 
     def run(self, *args: str, check: bool = True, raw: bool = False) -> subprocess.CompletedProcess:
         command = [str(self.pwcli), f"-s={self.session}"]
@@ -74,7 +79,10 @@ class BrowserCli:
             [str(self.pwcli), "list"], text=True, capture_output=True, errors="replace"
         )
         if self.session not in listing.stdout:
-            self.run("open", "about:blank", "--headed")
+            arguments = ["open", "about:blank"]
+            if self.headed:
+                arguments.append("--headed")
+            self.run(*arguments)
 
 
 def ensure_auth_ignored(state: Path) -> None:
@@ -820,6 +828,10 @@ def login_save(args: argparse.Namespace) -> None:
     state = args.state.resolve()
     browser = BrowserCli(args.session)
     browser.ensure_session()
+    save_login_state(browser, state)
+
+
+def save_login_state(browser: BrowserCli, state: Path) -> None:
     snapshot = browser.run("snapshot").stdout
     if not authenticated(snapshot):
         raise CliError("当前页面仍未进入北大树洞首页，请先完成登录。")
@@ -828,6 +840,56 @@ def login_save(args: argparse.Namespace) -> None:
     state.chmod(0o600)
     ensure_auth_ignored(state)
     print(f"登录状态已保存：{state}")
+
+
+def ensure_standalone_login(args: argparse.Namespace) -> None:
+    state = args.state.resolve()
+    if not state.is_file() and args.non_interactive:
+        raise CliError(
+            "未找到本地登录状态；--non-interactive 模式不会等待人工登录。"
+            "请先不带该参数运行一次 standalone。"
+        )
+
+    browser = BrowserCli(args.session, headed=not args.non_interactive)
+    browser.ensure_session()
+    if state.is_file():
+        try:
+            browser.run("goto", "about:blank")
+            browser.run("state-load", native_path(state))
+            browser.run("goto", SITE_URL)
+            if authenticated(browser.run("snapshot").stdout):
+                print("已加载有效登录状态，继续自动采集。", flush=True)
+                return
+            reason = "已保存的登录状态已失效"
+        except CliError:
+            reason = "已保存的登录状态无法加载"
+            if not args.non_interactive:
+                browser.run("goto", SITE_URL)
+    else:
+        browser.run("goto", SITE_URL)
+        reason = "未找到本地登录状态"
+
+    if args.non_interactive:
+        raise CliError(
+            f"{reason}；--non-interactive 模式不会等待人工登录。"
+            "请先不带该参数运行一次 standalone。"
+        )
+
+    print(
+        f"{reason}。可视浏览器已打开，请亲自完成北大统一身份认证。\n"
+        "进入北大树洞首页后，回到此终端按 Enter 继续。",
+        flush=True,
+    )
+    try:
+        input()
+    except EOFError as error:
+        raise CliError("需要交互式终端完成首次登录。") from error
+    save_login_state(browser, state)
+
+
+def run_standalone(args: argparse.Namespace) -> None:
+    ensure_standalone_login(args)
+    run_digest(args)
 
 
 def run_persistent_collector(
@@ -1206,6 +1268,26 @@ def run_digest(args: argparse.Namespace) -> None:
         cache.close()
 
 
+def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--since", type=parse_date)
+    parser.add_argument("--until", type=parse_date)
+    parser.add_argument(
+        "--min-comments", type=int, help="Require reply count to be strictly greater than N"
+    )
+    parser.add_argument(
+        "--min-favorites", type=int, help="Require favorite count to be strictly greater than N"
+    )
+    parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--checkpoint-pages", type=int, default=500)
+    parser.add_argument("--cache-chunk-pages", type=int, default=5)
+    parser.add_argument("--max-total-pages", type=int, default=2000)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--cache", type=Path)
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--output", type=Path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Low-frequency PKU Treehole digest collector")
     parser.add_argument("--session", default="pku-hole-digest")
@@ -1214,24 +1296,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("login-open")
     subparsers.add_parser("login-save")
-    run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("--days", type=int, default=30)
-    run_parser.add_argument("--since", type=parse_date)
-    run_parser.add_argument("--until", type=parse_date)
-    run_parser.add_argument(
-        "--min-comments", type=int, help="Require reply count to be strictly greater than N"
+    add_digest_arguments(subparsers.add_parser("run"))
+    standalone_parser = subparsers.add_parser(
+        "standalone",
+        help="Run without AI assistance and handle interactive login when needed",
     )
-    run_parser.add_argument(
-        "--min-favorites", type=int, help="Require favorite count to be strictly greater than N"
+    add_digest_arguments(standalone_parser)
+    standalone_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Fail instead of waiting for login; suitable for cron after initial setup",
     )
-    run_parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
-    run_parser.add_argument("--checkpoint-pages", type=int, default=500)
-    run_parser.add_argument("--cache-chunk-pages", type=int, default=5)
-    run_parser.add_argument("--max-total-pages", type=int, default=2000)
-    run_parser.add_argument("--checkpoint", type=Path)
-    run_parser.add_argument("--cache", type=Path)
-    run_parser.add_argument("--fresh", action="store_true")
-    run_parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -1242,6 +1317,8 @@ def main() -> None:
             login_open(args)
         elif args.command == "login-save":
             login_save(args)
+        elif args.command == "standalone":
+            run_standalone(args)
         else:
             run_digest(args)
     except CliError as error:

@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "run_digest.py"
@@ -53,6 +54,91 @@ class ThresholdTests(unittest.TestCase):
             {"favorites_complete": 0},
         )
         self.assertFalse(checkpoint["favorites_complete"])
+
+
+class StandaloneTests(unittest.TestCase):
+    def parse_standalone(self, *arguments: str) -> argparse.Namespace:
+        return run_digest.build_parser().parse_args(["standalone", *arguments])
+
+    def test_standalone_parser_supports_digest_and_scheduler_flags(self) -> None:
+        args = self.parse_standalone(
+            "--days", "7", "--min-favorites", "25", "--non-interactive"
+        )
+        self.assertEqual(args.command, "standalone")
+        self.assertEqual(args.days, 7)
+        self.assertEqual(args.min_favorites, 25)
+        self.assertTrue(args.non_interactive)
+
+    def test_find_pwcli_prefers_bundled_wrapper(self) -> None:
+        with patch.dict(run_digest.os.environ, {"PWCLI": ""}):
+            self.assertEqual(
+                run_digest.find_pwcli(),
+                MODULE_PATH.with_name("playwright_cli.sh"),
+            )
+
+    def test_non_interactive_browser_session_opens_headless(self) -> None:
+        with patch.object(
+            run_digest, "find_pwcli", return_value=Path("/tmp/playwright-cli")
+        ):
+            browser = run_digest.BrowserCli("scheduler", headed=False)
+        browser.run = MagicMock()
+        with patch.object(
+            run_digest.subprocess,
+            "run",
+            return_value=argparse.Namespace(stdout="### Browsers\n", returncode=0),
+        ):
+            browser.ensure_session()
+        browser.run.assert_called_once_with("open", "about:blank")
+
+    def test_non_interactive_mode_rejects_missing_login_state(self) -> None:
+        events = []
+
+        class FakeBrowser:
+            def __init__(self, session: str, headed: bool = True):
+                events.append(("init", session, headed))
+
+            def ensure_session(self) -> None:
+                events.append(("ensure",))
+
+            def run(self, *arguments: str, **_kwargs):
+                events.append(arguments)
+                return argparse.Namespace(stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.parse_standalone("--non-interactive")
+            args.state = Path(directory) / "missing.json"
+            with patch.object(run_digest, "BrowserCli", FakeBrowser):
+                with self.assertRaisesRegex(run_digest.CliError, "--non-interactive"):
+                    run_digest.ensure_standalone_login(args)
+
+        self.assertEqual(events, [])
+
+    def test_valid_saved_state_continues_without_prompt(self) -> None:
+        class FakeBrowser:
+            def __init__(self, _session: str, headed: bool = True):
+                self.headed = headed
+
+            def ensure_session(self) -> None:
+                pass
+
+            def run(self, *arguments: str, **_kwargs):
+                if arguments == ("snapshot",):
+                    return argparse.Namespace(
+                        stdout=(
+                            "Page Title: 北大树洞\n"
+                            "https://treehole.pku.edu.cn/ch/web/pc/index"
+                        )
+                    )
+                return argparse.Namespace(stdout="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.touch()
+            args = self.parse_standalone("--non-interactive")
+            args.state = state
+            with patch.object(run_digest, "BrowserCli", FakeBrowser):
+                with patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                    run_digest.ensure_standalone_login(args)
 
 
 class CacheStoreTests(unittest.TestCase):
