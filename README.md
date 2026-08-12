@@ -39,10 +39,6 @@ git clone https://github.com/WuCasZhe/holeclaw.git "$HOLECLAW_SKILLS_DIR/holecla
 
 ```text
 $holeclaw 汇总 2026-07-01 到 2026-07-31 评论数大于 100 的帖子，给出树洞号和简介
-
-$holeclaw 汇总近 7 天收藏数大于 50 的帖子
-
-$holeclaw 汇总近 30 天评论数大于 100 且收藏数大于 50 的帖子
 ```
 
 对应命令行参数：
