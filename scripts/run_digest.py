@@ -23,7 +23,7 @@ SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 class CliError(RuntimeError):
@@ -138,13 +138,26 @@ def time_window(args: argparse.Namespace) -> tuple[int, int, str]:
     return int(start.timestamp()), int(min(end, now).timestamp()), label
 
 
+def resolve_thresholds(args: argparse.Namespace) -> None:
+    if args.min_comments is None and args.min_favorites is None:
+        args.min_comments = 50
+    if args.min_comments is not None and args.min_comments < 0:
+        raise CliError("--min-comments cannot be negative.")
+    if args.min_favorites is not None and args.min_favorites < 0:
+        raise CliError("--min-favorites cannot be negative.")
+
+
 def window_spec(args: argparse.Namespace) -> dict:
-    return {
+    spec = {
         "days": None if args.since else args.days,
         "since": args.since.isoformat() if args.since else None,
         "until": args.until.isoformat() if args.until else None,
         "min_comments": args.min_comments,
     }
+    # Preserve compatibility with checkpoints created before favorite filtering existed.
+    if args.min_favorites is not None:
+        spec["min_favorites"] = args.min_favorites
+    return spec
 
 
 def default_checkpoint_path(spec: dict) -> Path:
@@ -193,6 +206,9 @@ def new_checkpoint(
         "total_scanned": 0,
         "details_requested": 0,
         "matched_by_pid": {},
+        "favorites_complete": (
+            bool(cache_base.get("favorites_complete", False)) if cache_base else True
+        ),
         "reached_start": False,
         "feed_exhausted": False,
         "completed": False,
@@ -212,6 +228,7 @@ def load_checkpoint(path: Path, spec: dict) -> dict:
         )
     checkpoint.setdefault("scan_start_timestamp", checkpoint["start_timestamp"])
     checkpoint.setdefault("cache_base", None)
+    checkpoint.setdefault("favorites_complete", False)
     return checkpoint
 
 
@@ -240,6 +257,7 @@ class CacheStore:
                     pid TEXT PRIMARY KEY,
                     timestamp INTEGER NOT NULL,
                     reply INTEGER NOT NULL,
+                    favorites INTEGER,
                     type TEXT NOT NULL,
                     text TEXT NOT NULL,
                     observed_at INTEGER NOT NULL,
@@ -261,9 +279,26 @@ class CacheStore:
                     end_timestamp INTEGER NOT NULL,
                     completed_at TEXT NOT NULL,
                     source_pages INTEGER NOT NULL,
-                    source_scanned INTEGER NOT NULL
+                    source_scanned INTEGER NOT NULL,
+                    favorites_complete INTEGER NOT NULL DEFAULT 0
                 )
                 """
+            )
+            post_columns = {
+                str(row[1]) for row in self.connection.execute("PRAGMA table_info(posts)")
+            }
+            if "favorites" not in post_columns:
+                self.connection.execute("ALTER TABLE posts ADD COLUMN favorites INTEGER")
+            coverage_columns = {
+                str(row[1]) for row in self.connection.execute("PRAGMA table_info(coverage)")
+            }
+            if "favorites_complete" not in coverage_columns:
+                self.connection.execute(
+                    "ALTER TABLE coverage ADD COLUMN favorites_complete "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS posts_favorites_idx ON posts(favorites)"
             )
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS coverage_window_idx "
@@ -302,14 +337,23 @@ class CacheStore:
             pid = str(row.get("pid", ""))
             timestamp = int(row.get("timestamp", 0))
             reply = int(row.get("reply", 0))
+            raw_favorites = row.get("favorites")
+            favorites = None if raw_favorites is None else int(raw_favorites)
             source_page = int(row.get("source_page", 0))
-            if not pid or timestamp <= 0 or reply < 0 or source_page <= 0:
+            if (
+                not pid
+                or timestamp <= 0
+                or reply < 0
+                or (favorites is not None and favorites < 0)
+                or source_page <= 0
+            ):
                 raise CliError("Collector returned an invalid cache row.")
             values.append(
                 (
                     pid,
                     timestamp,
                     reply,
+                    favorites,
                     str(row.get("type") or "text"),
                     str(row.get("text") or ""),
                     observed_at,
@@ -319,11 +363,17 @@ class CacheStore:
         with self.lock:
             self.connection.executemany(
                 """
-                INSERT INTO posts(pid, timestamp, reply, type, text, observed_at, source_page)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO posts(
+                    pid, timestamp, reply, favorites, type, text, observed_at, source_page
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pid) DO UPDATE SET
                     timestamp=excluded.timestamp,
                     reply=excluded.reply,
+                    favorites=CASE
+                        WHEN excluded.favorites IS NOT NULL THEN excluded.favorites
+                        ELSE posts.favorites
+                    END,
                     type=excluded.type,
                     text=CASE WHEN excluded.text <> '' THEN excluded.text ELSE posts.text END,
                     observed_at=excluded.observed_at,
@@ -333,25 +383,43 @@ class CacheStore:
             )
             self.connection.commit()
 
-    def query_posts(self, start_ts: int, end_ts: int, min_comments: int) -> list[dict]:
+    def query_posts(
+        self,
+        start_ts: int,
+        end_ts: int,
+        min_comments: int | None,
+        min_favorites: int | None,
+    ) -> list[dict]:
+        filters = ["timestamp >= ?", "timestamp < ?"]
+        parameters: list[int] = [start_ts, end_ts]
+        if min_comments is not None:
+            filters.append("reply > ?")
+            parameters.append(min_comments)
+        if min_favorites is not None:
+            filters.append("favorites > ?")
+            parameters.append(min_favorites)
         with self.lock:
             rows = self.connection.execute(
-                """
-                SELECT pid, timestamp, reply, type, text
+                f"""
+                SELECT pid, timestamp, reply, favorites, type, text
                 FROM posts
-                WHERE timestamp >= ? AND timestamp < ? AND reply > ?
+                WHERE {' AND '.join(filters)}
                 ORDER BY timestamp DESC, pid DESC
                 """,
-                (start_ts, end_ts, min_comments),
+                parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def find_covering(self, start_ts: int, end_ts: int) -> dict | None:
+    def find_covering(
+        self, start_ts: int, end_ts: int, require_favorites: bool = False
+    ) -> dict | None:
+        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
         with self.lock:
             row = self.connection.execute(
-                """
+                f"""
                 SELECT * FROM coverage
                 WHERE start_timestamp <= ? AND end_timestamp >= ?
+                {favorites_clause}
                 ORDER BY end_timestamp DESC, completed_at DESC
                 LIMIT 1
                 """,
@@ -359,12 +427,16 @@ class CacheStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def find_prefix(self, start_ts: int, end_ts: int) -> dict | None:
+    def find_prefix(
+        self, start_ts: int, end_ts: int, require_favorites: bool = False
+    ) -> dict | None:
+        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
         with self.lock:
             row = self.connection.execute(
-                """
+                f"""
                 SELECT * FROM coverage
                 WHERE start_timestamp <= ? AND end_timestamp > ? AND end_timestamp < ?
+                {favorites_clause}
                 ORDER BY end_timestamp DESC, completed_at DESC
                 LIMIT 1
                 """,
@@ -373,16 +445,23 @@ class CacheStore:
         return dict(row) if row else None
 
     def add_coverage(
-        self, start_ts: int, end_ts: int, completed_at: str, pages: int, scanned: int
+        self,
+        start_ts: int,
+        end_ts: int,
+        completed_at: str,
+        pages: int,
+        scanned: int,
+        favorites_complete: bool,
     ) -> None:
         with self.lock:
             self.connection.execute(
                 """
                 INSERT INTO coverage(
-                    start_timestamp, end_timestamp, completed_at, source_pages, source_scanned
-                ) VALUES(?, ?, ?, ?, ?)
+                    start_timestamp, end_timestamp, completed_at, source_pages, source_scanned,
+                    favorites_complete
+                ) VALUES(?, ?, ?, ?, ?, ?)
                 """,
-                (start_ts, end_ts, completed_at, pages, scanned),
+                (start_ts, end_ts, completed_at, pages, scanned, int(favorites_complete)),
             )
             self.connection.commit()
 
@@ -401,12 +480,14 @@ class RunSink:
         cache: CacheStore,
         checkpoint: dict,
         checkpoint_path: Path,
-        min_comments: int,
+        min_comments: int | None,
+        min_favorites: int | None,
     ):
         self.cache = cache
         self.checkpoint = checkpoint
         self.checkpoint_path = checkpoint_path
         self.min_comments = min_comments
+        self.min_favorites = min_favorites
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.last_progress: dict | None = None
@@ -433,24 +514,36 @@ class RunSink:
             matches = payload.get("matches") or []
             if len(rows) != scanned:
                 raise CliError("Collector cache row count does not match scanned count.")
+            missing_favorites = any(row.get("favorites") is None for row in rows)
+            if self.min_favorites is not None and missing_favorites:
+                raise CliError("Collector omitted favorite counts required by the filter.")
             self.cache.upsert_posts(rows)
+            if missing_favorites:
+                self.checkpoint["favorites_complete"] = False
 
             report_start = self.checkpoint["start_timestamp"]
             report_end = self.checkpoint["end_timestamp"]
             for post in matches:
                 timestamp = int(post.get("timestamp", 0))
                 reply = int(post.get("reply", 0))
+                raw_favorites = post.get("favorites")
+                favorites = None if raw_favorites is None else int(raw_favorites)
                 pid = str(post.get("pid", ""))
                 if (
                     not pid
                     or not (report_start <= timestamp < report_end)
-                    or reply <= self.min_comments
+                    or (self.min_comments is not None and reply <= self.min_comments)
+                    or (
+                        self.min_favorites is not None
+                        and (favorites is None or favorites <= self.min_favorites)
+                    )
                 ):
                     raise CliError("Collector returned a post outside the requested filter.")
                 self.checkpoint["matched_by_pid"][pid] = {
                     "pid": pid,
                     "timestamp": timestamp,
                     "reply": reply,
+                    "favorites": favorites,
                     "type": str(post.get("type") or "text"),
                     "text": str(post.get("text") or ""),
                 }
@@ -610,6 +703,7 @@ def checkpoint_report_data(checkpoint: dict) -> dict:
         "start_timestamp": checkpoint["start_timestamp"],
         "end_timestamp": checkpoint["end_timestamp"],
         "min_comments": checkpoint["request"]["min_comments"],
+        "min_favorites": checkpoint["request"].get("min_favorites"),
         "pages": checkpoint["total_pages"],
         "scanned": checkpoint["total_scanned"],
         "details_requested": checkpoint["details_requested"],
@@ -623,19 +717,21 @@ def cache_report_data(
     cache: CacheStore,
     start_ts: int,
     end_ts: int,
-    min_comments: int,
+    min_comments: int | None,
+    min_favorites: int | None,
     collected_at: str,
     pages: int,
     scanned: int,
     details_requested: int,
     cache_reused: bool,
 ) -> dict:
-    candidates = cache.query_posts(start_ts, end_ts, min_comments)
+    candidates = cache.query_posts(start_ts, end_ts, min_comments, min_favorites)
     return {
         "collected_at": collected_at,
         "start_timestamp": start_ts,
         "end_timestamp": end_ts,
         "min_comments": min_comments,
+        "min_favorites": min_favorites,
         "pages": pages,
         "scanned": scanned,
         "details_requested": details_requested,
@@ -654,22 +750,46 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
     collected = datetime.fromisoformat(data["collected_at"].replace("Z", "+00:00")).astimezone(SHANGHAI)
     start = datetime.fromtimestamp(data["start_timestamp"], SHANGHAI)
     end = datetime.fromtimestamp(data["end_timestamp"], SHANGHAI)
-    threshold = data["min_comments"]
+    min_comments = data["min_comments"]
+    min_favorites = data["min_favorites"]
+    if min_comments is not None and min_favorites is not None:
+        title = "北大树洞高评论与高收藏帖报告"
+    elif min_favorites is not None:
+        title = "北大树洞高收藏帖报告"
+    else:
+        title = "北大树洞高评论帖报告"
     lines = [
-        f"# 北大树洞高评论帖报告（{window_label}）",
+        f"# {title}（{window_label}）",
         "",
         f"- 生成时间：{collected:%Y-%m-%d %H:%M:%S}（Asia/Shanghai）",
         f"- 时间范围：{start:%Y-%m-%d %H:%M:%S} 至 {end:%Y-%m-%d %H:%M:%S}",
-        f"- 筛选条件：评论数 > {threshold}",
-        f"- 本次网络扫描：{data['pages']} 页，{data['scanned']:,} 条帖子",
-        f"- 命中：{data['candidate_count']} 条",
     ]
+    conditions = []
+    if min_comments is not None:
+        conditions.append(f"评论数 > {min_comments}")
+    if min_favorites is not None:
+        conditions.append(f"收藏数 > {min_favorites}")
+    lines.extend(
+        [
+            f"- 筛选条件：{' 且 '.join(conditions)}",
+            f"- 本次网络扫描：{data['pages']} 页，{data['scanned']:,} 条帖子",
+            f"- 命中：{data['candidate_count']} 条",
+        ]
+    )
     if data.get("cache_reused"):
         lines.append("- 数据来源：SQLite 本地缓存（必要的新时间段已增量扫描）")
+    has_favorite_snapshots = min_favorites is not None or any(
+        post.get("favorites") is not None for post in data["candidates"]
+    )
+    snapshot_note = (
+        "评论数和收藏数为最近一次采集快照。"
+        if has_favorite_snapshots
+        else "评论数为最近一次采集快照。"
+    )
     lines.extend(
         [
             "",
-            "> 评论数为最近一次采集快照。图片帖默认仅摘要文字说明，不对图片做 OCR。",
+            f"> {snapshot_note}图片帖默认仅摘要文字说明，不对图片做 OCR。",
             "",
         ]
     )
@@ -677,8 +797,12 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
         lines.extend([f"## {day}", ""])
         for local_time, post in grouped[day]:
             summary = one_line_summary(post.get("text", ""), post.get("type", "text"))
+            metrics = [f"{post['reply']} 条评论"]
+            if post.get("favorites") is not None:
+                metrics.append(f"{post['favorites']} 次收藏")
             lines.append(
-                f"- **#{post['pid']}** · {post['reply']} 条评论 · {local_time:%H:%M} — {summary}"
+                f"- **#{post['pid']}** · {' · '.join(metrics)} · "
+                f"{local_time:%H:%M} — {summary}"
             )
         lines.append("")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -723,6 +847,7 @@ def run_persistent_collector(
         "scan_start_timestamp": checkpoint["scan_start_timestamp"],
         "end_timestamp": checkpoint["end_timestamp"],
         "min_comments": args.min_comments,
+        "min_favorites": args.min_favorites,
         "start_page": checkpoint["next_page"],
         "page_size": 500,
         "max_pages": remaining,
@@ -801,8 +926,7 @@ def run_persistent_collector(
 
 
 def run_digest(args: argparse.Namespace) -> None:
-    if args.min_comments < 0:
-        raise CliError("--min-comments cannot be negative.")
+    resolve_thresholds(args)
     if args.checkpoint_pages <= 0 or args.checkpoint_pages > 500:
         raise CliError("--checkpoint-pages must be between 1 and 500.")
     if args.cache_chunk_pages <= 0 or args.cache_chunk_pages > 20:
@@ -818,7 +942,16 @@ def run_digest(args: argparse.Namespace) -> None:
     cache_path = (args.cache or default_cache_path()).resolve()
     ensure_runtime_ignored(checkpoint_path, cache_path)
     cache_existed = cache_path.exists()
-    output = args.output or Path.cwd() / "reports" / f"pku-treehole-high-comments-{date.today().isoformat()}.md"
+    if args.min_favorites is not None and args.min_comments is None:
+        report_slug = "high-favorites"
+    elif args.min_favorites is not None:
+        report_slug = "high-comments-and-favorites"
+    else:
+        report_slug = "high-comments"
+    output = (
+        args.output
+        or Path.cwd() / "reports" / f"pku-treehole-{report_slug}-{date.today().isoformat()}.md"
+    )
     output = output.resolve()
     cache = CacheStore(cache_path)
     try:
@@ -877,13 +1010,16 @@ def run_digest(args: argparse.Namespace) -> None:
                 checkpoint["cache_path"] = str(cache_path)
                 checkpoint["cache_instance_id"] = cache.instance_id
             if checkpoint["completed"]:
-                coverage = cache.find_covering(start_ts, end_ts)
+                coverage = cache.find_covering(
+                    start_ts, end_ts, require_favorites=args.min_favorites is not None
+                )
                 if coverage:
                     data = cache_report_data(
                         cache,
                         start_ts,
                         end_ts,
                         args.min_comments,
+                        args.min_favorites,
                         coverage["completed_at"],
                         0,
                         0,
@@ -914,13 +1050,20 @@ def run_digest(args: argparse.Namespace) -> None:
             )
 
         if checkpoint is None:
-            covering = None if args.fresh else cache.find_covering(start_ts, end_ts)
+            covering = (
+                None
+                if args.fresh
+                else cache.find_covering(
+                    start_ts, end_ts, require_favorites=args.min_favorites is not None
+                )
+            )
             if covering:
                 data = cache_report_data(
                     cache,
                     start_ts,
                     end_ts,
                     args.min_comments,
+                    args.min_favorites,
                     covering["completed_at"],
                     0,
                     0,
@@ -943,7 +1086,13 @@ def run_digest(args: argparse.Namespace) -> None:
                 )
                 return
 
-            cache_base = None if args.fresh else cache.find_prefix(start_ts, end_ts)
+            cache_base = (
+                None
+                if args.fresh
+                else cache.find_prefix(
+                    start_ts, end_ts, require_favorites=args.min_favorites is not None
+                )
+            )
             scan_start_ts = cache_base["end_timestamp"] if cache_base else start_ts
             checkpoint = new_checkpoint(
                 spec,
@@ -978,12 +1127,23 @@ def run_digest(args: argparse.Namespace) -> None:
         if not authenticated(snapshot):
             raise CliError("登录已失效或未成功加载，请重新执行 login-open 和 login-save。")
 
+        conditions = []
+        if args.min_comments is not None:
+            conditions.append(f"评论数 > {args.min_comments}")
+        if args.min_favorites is not None:
+            conditions.append(f"收藏数 > {args.min_favorites}")
         print(
-            f"开始常驻限速扫描：{window_label}，评论数 > {args.min_comments}，"
+            f"开始常驻限速扫描：{window_label}，{' 且 '.join(conditions)}，"
             f"单线程 0.6–2 秒间隔，默认每 {args.checkpoint_pages} 页保存检查点。",
             flush=True,
         )
-        sink = RunSink(cache, checkpoint, checkpoint_path, args.min_comments)
+        sink = RunSink(
+            cache,
+            checkpoint,
+            checkpoint_path,
+            args.min_comments,
+            args.min_favorites,
+        )
         server = SinkServer(sink)
         try:
             result = run_persistent_collector(browser, args, checkpoint, sink, server.url)
@@ -1012,12 +1172,14 @@ def run_digest(args: argparse.Namespace) -> None:
             checkpoint["completed_at"],
             checkpoint["total_pages"],
             checkpoint["total_scanned"],
+            checkpoint["favorites_complete"],
         )
         data = cache_report_data(
             cache,
             start_ts,
             end_ts,
             args.min_comments,
+            args.min_favorites,
             checkpoint["completed_at"],
             checkpoint["total_pages"],
             checkpoint["total_scanned"],
@@ -1056,7 +1218,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--days", type=int, default=30)
     run_parser.add_argument("--since", type=parse_date)
     run_parser.add_argument("--until", type=parse_date)
-    run_parser.add_argument("--min-comments", type=int, default=50)
+    run_parser.add_argument(
+        "--min-comments", type=int, help="Require reply count to be strictly greater than N"
+    )
+    run_parser.add_argument(
+        "--min-favorites", type=int, help="Require favorite count to be strictly greater than N"
+    )
     run_parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
     run_parser.add_argument("--checkpoint-pages", type=int, default=500)
     run_parser.add_argument("--cache-chunk-pages", type=int, default=5)

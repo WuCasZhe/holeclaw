@@ -13,6 +13,7 @@ async (page) => {
     scan_start_timestamp: scanStartTimestamp,
     end_timestamp: endTimestamp,
     min_comments: minComments,
+    min_favorites: minFavorites,
     start_page: startPage = 1,
     page_size: pageSize = 500,
     max_pages: maxPages = 2000,
@@ -42,7 +43,12 @@ async (page) => {
     delayMinMs !== 600 ||
     delayMaxMs !== 2000 ||
     typeof sinkUrl !== 'string' ||
-    !sinkUrl.startsWith('http://127.0.0.1:')
+    !sinkUrl.startsWith('http://127.0.0.1:') ||
+    (minComments !== null &&
+      (!Number.isInteger(minComments) || minComments < 0)) ||
+    (minFavorites !== null &&
+      (!Number.isInteger(minFavorites) || minFavorites < 0)) ||
+    (minComments === null && minFavorites === null)
   ) {
     throw new Error('Unsafe request configuration.');
   }
@@ -70,6 +76,7 @@ async (page) => {
         scanStartTimestamp,
         endTimestamp,
         minComments,
+        minFavorites,
         startPage,
         pageSize,
         maxPages,
@@ -159,6 +166,9 @@ async (page) => {
         let chunkDetails = 0;
         let pendingRows = [];
         let pendingMatches = [];
+        const matchesThresholds = (post) =>
+          (minComments === null || post.reply > minComments) &&
+          (minFavorites === null || post.favorites > minFavorites);
 
         for (let offset = 0; offset < maxPages; offset += 1) {
           const pageNumber = startPage + offset;
@@ -180,10 +190,24 @@ async (page) => {
 
           const rowsByPid = new Map();
           for (const post of posts) {
+            const rawFavorites = post.likenum;
+            const favorites =
+              rawFavorites === null || rawFavorites === undefined || rawFavorites === ''
+                ? null
+                : Number(rawFavorites);
+            if (
+              (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) ||
+              (minFavorites !== null && favorites === null)
+            ) {
+              throw new Error(
+                `Favorite count (likenum) is unavailable or invalid on list page ${pageNumber}.`,
+              );
+            }
             const row = {
               pid: String(post.pid),
               timestamp: Number(post.timestamp),
               reply: Number(post.reply),
+              favorites,
               type: post.type || 'text',
               text: post.text || '',
               source_page: pageNumber,
@@ -193,7 +217,7 @@ async (page) => {
             if (
               row.timestamp >= reportStartTimestamp &&
               row.timestamp < endTimestamp &&
-              row.reply > minComments
+              matchesThresholds(row)
             ) {
               pendingMatches.push({ ...row });
             }
@@ -212,17 +236,29 @@ async (page) => {
             post.text = hole.text || post.text;
             post.type = hole.type || post.type;
             post.reply = Number(hole.reply ?? post.reply);
+            const detailFavorites =
+              hole.likenum === null || hole.likenum === undefined || hole.likenum === ''
+                ? post.favorites
+                : Number(hole.likenum);
+            if (
+              detailFavorites !== null &&
+              (!Number.isInteger(detailFavorites) || detailFavorites < 0)
+            ) {
+              throw new Error(`Favorite count (likenum) is invalid for detail #${post.pid}.`);
+            }
+            post.favorites = detailFavorites;
             const cached = rowsByPid.get(post.pid);
             if (cached) {
               cached.text = post.text;
               cached.type = post.type;
               cached.reply = post.reply;
+              cached.favorites = post.favorites;
             }
             detailsRequested += 1;
             chunkDetails += 1;
           }
           pendingMatches = pendingMatches.filter(
-            (post) => post.source_page !== pageNumber || post.reply > minComments,
+            (post) => post.source_page !== pageNumber || matchesThresholds(post),
           );
 
           const oldest = Number(posts.at(-1)?.timestamp || 0);
@@ -290,6 +326,7 @@ async (page) => {
         scanStartTimestamp,
         endTimestamp,
         minComments,
+        minFavorites,
         startPage,
         pageSize,
         maxPages,

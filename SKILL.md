@@ -1,6 +1,6 @@
 ---
 name: holeclaw
-description: HoleClaw performs rate-limited, sequential, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子" or "树洞高评论日报".
+description: HoleClaw performs rate-limited, sequential, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment or high-favorite posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子", "收藏数大于 50 的树洞", or "树洞高评论日报".
 ---
 
 # HoleClaw
@@ -12,7 +12,9 @@ Use the bundled browser collector and renderer. Keep the workflow read-only and 
 - Accept `近 N 天` as `--days N`.
 - Accept an explicit inclusive local date range as `--since YYYY-MM-DD --until YYYY-MM-DD`.
 - Accept `评论数大于 N` as `--min-comments N`. The comparison is strictly `reply > N`.
-- Default to `--days 30 --min-comments 50` only when the user omits a value.
+- Accept `收藏数大于 N` or `关注数大于 N` as `--min-favorites N`. The comparison is strictly `likenum > N`.
+- When both thresholds are present, require both conditions (logical AND).
+- Default to `--days 30 --min-comments 50` only when the user omits both engagement thresholds. A favorite-only request must not silently add the default comment filter.
 - Reject non-positive days, negative thresholds, an end before a start, and future-only ranges.
 - Warn before scanning a range older than 90 days or a past range far behind the current feed; the API is newest-first and must traverse intervening posts.
 
@@ -49,6 +51,13 @@ Examples:
 # Rolling time window
 python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-comments 100
 
+# Favorite-only filter
+python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-favorites 50
+
+# Require both thresholds
+python3 "$SKILL_DIR/scripts/run_digest.py" run \
+  --days 7 --min-comments 100 --min-favorites 50
+
 # Inclusive local calendar range
 python3 "$SKILL_DIR/scripts/run_digest.py" run \
   --since 2026-07-01 --until 2026-07-31 --min-comments 80
@@ -61,13 +70,13 @@ python3 "$SKILL_DIR/scripts/run_digest.py" run \
 
 Use `--output PATH` only when the user specifies an output location. Otherwise write under `reports/` in the current workspace.
 
-Use one persistent browser collector for the whole run. It performs list parsing and time/comment filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint.
+Use one persistent browser collector for the whole run. It performs list parsing and time/comment/favorite filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint.
 
 The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.
 
 Write the visible checkpoint every `--checkpoint-pages` pages; the default and maximum are 500 pages. SQLite/WAL cache chunks are committed more frequently, and an error flushes the latest durable progress before exit. Re-run the exact same command to resume from `next_page`; a rolling window keeps its first start and end timestamps frozen.
 
-Store checkpoints under `output/playwright/holeclaw-checkpoints/` and the shared cache at `output/playwright/holeclaw-cache.sqlite3`, both with mode `0600`. The cache is independent of the report threshold: reuse complete coverage for different thresholds or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
+Store checkpoints under `output/playwright/holeclaw-checkpoints/` and the shared cache at `output/playwright/holeclaw-cache.sqlite3`, both with mode `0600`. The cache is independent of the report threshold: reuse complete coverage for different thresholds or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Cache coverage created before favorite counts were stored remains reusable for comment-only reports, but favorite-filtered reports must rescan that coverage once to populate `likenum`. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
 
 ### 3. Handle authentication expiry
 
@@ -79,13 +88,13 @@ If `run` reports that the page returned to `iaaa.pku.edu.cn`, repeat `login-open
 - Keep the checkpoint interval at or below 500 pages and the default total safety ceiling at 2,000 pages.
 - Keep one persistent collector process and send no concurrent Treehole requests.
 - Keep progress/completion event-driven through the localhost sink; never poll with extra Playwright CLI calls.
-- Filter requested matches inside the browser request process; send cache chunks only to the tokenized `127.0.0.1` sink.
+- Filter requested comment/favorite matches inside the browser request process; send cache chunks only to the tokenized `127.0.0.1` sink.
 - Save accumulated PIDs, counts, and `next_page` atomically at checkpoint boundaries and on errors.
 - Store all list rows in SQLite/WAL so later thresholds and covered time ranges can be rendered without rescanning.
 - Send requests sequentially with no concurrency.
 - Stop as soon as the collector crosses the requested start time.
 - Honor `Retry-After`; back off on transient fetch/network errors and 429/5xx, then stop after three failed attempts.
-- Do not mass-fetch detail endpoints when list responses already contain the full post text and reply count. Fetch details only when required data is missing.
+- Do not mass-fetch detail endpoints when list responses already contain the full post text, reply count, and favorite count. Fetch details only when required data is missing.
 - Do not like, follow, comment, publish, or modify account state.
 - Do not auto-save browser authentication after scans; use `login-save` only after an intentional login refresh.
 
@@ -95,9 +104,9 @@ After the script completes, check:
 
 - `reached_start` is true.
 - SQLite `PRAGMA integrity_check` returns `ok` after a network run.
-- Every entry has `reply > min_comments`.
+- Every entry satisfies each requested threshold: `reply > min_comments` and/or `likenum > min_favorites`.
 - PIDs are unique.
 - Entries fall inside the requested time window.
 - The report contains a treehole number and a one-line content summary for every entry.
 
-Return a clickable path to the Markdown report plus scanned-page, scanned-post, and matched-post counts. Mention that comment counts are a scan-time snapshot and that image posts summarize captions only unless the user explicitly requests image analysis.
+Return a clickable path to the Markdown report plus scanned-page, scanned-post, and matched-post counts. Mention that comment and favorite counts are scan-time snapshots and that image posts summarize captions only unless the user explicitly requests image analysis.

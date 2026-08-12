@@ -1,6 +1,6 @@
 # HoleClaw
 
-HoleClaw 是一个树洞爬虫 Skill，它按时间范围和评论数阈值顺序读取帖子，并生成高评论帖子报告。
+HoleClaw 是一个树洞爬虫 Skill，它按时间范围、评论数和收藏数阈值顺序读取帖子，并生成筛选报告。
 
 ## 工作方式
 
@@ -39,4 +39,23 @@ git clone https://github.com/WuCasZhe/holeclaw.git "$HOLECLAW_SKILLS_DIR/holecla
 
 ```text
 $holeclaw 汇总 2026-07-01 到 2026-07-31 评论数大于 100 的帖子，给出树洞号和简介
+
+$holeclaw 汇总近 7 天收藏数大于 50 的帖子
+
+$holeclaw 汇总近 30 天评论数大于 100 且收藏数大于 50 的帖子
 ```
+
+对应命令行参数：
+
+```bash
+# 只按评论数筛选
+python3 scripts/run_digest.py run --days 7 --min-comments 100
+
+# 只按收藏数筛选（不会额外套用默认评论阈值）
+python3 scripts/run_digest.py run --days 7 --min-favorites 50
+
+# 两个条件同时满足
+python3 scripts/run_digest.py run --days 30 --min-comments 100 --min-favorites 50
+```
+
+阈值均为严格大于；两种阈值都不提供时，默认筛选近 30 天评论数大于 50 的帖子。
