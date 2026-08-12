@@ -47,10 +47,9 @@ $holeclaw 汇总 2026-07-01 到 2026-07-31 评论数大于 100 的帖子，给�
 # 只按评论数筛选
 python3 scripts/run_digest.py run --days 7 --min-comments 100
 
-# 只按收藏数筛选（不会额外套用默认评论阈值）
+# 只按收藏数筛选
 python3 scripts/run_digest.py run --days 7 --min-favorites 50
 
-# 两个条件同时满足
 python3 scripts/run_digest.py run --days 30 --min-comments 100 --min-favorites 50
 ```
 
