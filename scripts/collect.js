@@ -14,6 +14,7 @@ async (page) => {
     end_timestamp: endTimestamp,
     min_comments: minComments,
     min_favorites: minFavorites,
+    match_mode: matchMode = 'all',
     start_page: startPage = 1,
     page_size: pageSize = 500,
     max_pages: maxPages = 2000,
@@ -48,6 +49,8 @@ async (page) => {
       (!Number.isInteger(minComments) || minComments < 0)) ||
     (minFavorites !== null &&
       (!Number.isInteger(minFavorites) || minFavorites < 0)) ||
+    !['all', 'any'].includes(matchMode) ||
+    (matchMode === 'any' && (minComments === null || minFavorites === null)) ||
     (minComments === null && minFavorites === null)
   ) {
     throw new Error('Unsafe request configuration.');
@@ -77,6 +80,7 @@ async (page) => {
         endTimestamp,
         minComments,
         minFavorites,
+        matchMode,
         startPage,
         pageSize,
         maxPages,
@@ -166,9 +170,15 @@ async (page) => {
         let chunkDetails = 0;
         let pendingRows = [];
         let pendingMatches = [];
-        const matchesThresholds = (post) =>
-          (minComments === null || post.reply > minComments) &&
-          (minFavorites === null || post.favorites > minFavorites);
+        let pendingUnavailable = [];
+        const matchesThresholds = (post) => {
+          const conditions = [];
+          if (minComments !== null) conditions.push(post.reply > minComments);
+          if (minFavorites !== null) {
+            conditions.push(post.favorites !== null && post.favorites > minFavorites);
+          }
+          return matchMode === 'any' ? conditions.some(Boolean) : conditions.every(Boolean);
+        };
 
         for (let offset = 0; offset < maxPages; offset += 1) {
           const pageNumber = startPage + offset;
@@ -189,19 +199,15 @@ async (page) => {
           }
 
           const rowsByPid = new Map();
+          const detailsFetchedPids = new Set();
           for (const post of posts) {
             const rawFavorites = post.likenum;
-            const favorites =
+            let favorites =
               rawFavorites === null || rawFavorites === undefined || rawFavorites === ''
                 ? null
                 : Number(rawFavorites);
-            if (
-              (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) ||
-              (minFavorites !== null && favorites === null)
-            ) {
-              throw new Error(
-                `Favorite count (likenum) is unavailable or invalid on list page ${pageNumber}.`,
-              );
+            if (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) {
+              favorites = null;
             }
             const row = {
               pid: String(post.pid),
@@ -214,6 +220,44 @@ async (page) => {
             };
             rowsByPid.set(row.pid, row);
             pendingRows.push(row);
+          }
+
+          const missingFavorites = [...rowsByPid.values()].filter(
+            (post) => minFavorites !== null && post.favorites === null,
+          );
+          for (const post of missingFavorites) {
+            await sleep(jitter());
+            const detailJson = await requestJson(
+              `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
+              `detail #${post.pid}`,
+            );
+            const hole = detailJson?.data?.hole || {};
+            const rawDetailFavorites = hole.likenum;
+            let detailFavorites =
+              rawDetailFavorites === null ||
+              rawDetailFavorites === undefined ||
+              rawDetailFavorites === ''
+                ? null
+                : Number(rawDetailFavorites);
+            if (
+              detailFavorites !== null &&
+              (!Number.isInteger(detailFavorites) || detailFavorites < 0)
+            ) {
+              detailFavorites = null;
+            }
+            post.text = hole.text || post.text;
+            post.type = hole.type || post.type;
+            post.reply = Number(hole.reply ?? post.reply);
+            post.favorites = detailFavorites;
+            detailsFetchedPids.add(post.pid);
+            if (detailFavorites === null) {
+              pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
+            }
+            detailsRequested += 1;
+            chunkDetails += 1;
+          }
+
+          for (const row of rowsByPid.values()) {
             if (
               row.timestamp >= reportStartTimestamp &&
               row.timestamp < endTimestamp &&
@@ -224,7 +268,10 @@ async (page) => {
           }
 
           const missingText = pendingMatches.filter(
-            (post) => post.source_page === pageNumber && !post.text.trim(),
+            (post) =>
+              post.source_page === pageNumber &&
+              !post.text.trim() &&
+              !detailsFetchedPids.has(post.pid),
           );
           for (const post of missingText) {
             await sleep(jitter());
@@ -236,7 +283,7 @@ async (page) => {
             post.text = hole.text || post.text;
             post.type = hole.type || post.type;
             post.reply = Number(hole.reply ?? post.reply);
-            const detailFavorites =
+            let detailFavorites =
               hole.likenum === null || hole.likenum === undefined || hole.likenum === ''
                 ? post.favorites
                 : Number(hole.likenum);
@@ -244,9 +291,16 @@ async (page) => {
               detailFavorites !== null &&
               (!Number.isInteger(detailFavorites) || detailFavorites < 0)
             ) {
-              throw new Error(`Favorite count (likenum) is invalid for detail #${post.pid}.`);
+              detailFavorites = post.favorites;
             }
             post.favorites = detailFavorites;
+            if (
+              minFavorites !== null &&
+              detailFavorites === null &&
+              !pendingUnavailable.some((item) => item.pid === post.pid)
+            ) {
+              pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
+            }
             const cached = rowsByPid.get(post.pid);
             if (cached) {
               cached.text = post.text;
@@ -297,12 +351,14 @@ async (page) => {
               result,
               rows: pendingRows,
               matches: pendingMatches,
+              favorite_unavailable: pendingUnavailable,
             });
             chunkStartPage = pageNumber + 1;
             chunkScanned = 0;
             chunkDetails = 0;
             pendingRows = [];
             pendingMatches = [];
+            pendingUnavailable = [];
           }
           if (reachedStart || feedExhausted) break;
         }
@@ -327,6 +383,7 @@ async (page) => {
         endTimestamp,
         minComments,
         minFavorites,
+        matchMode,
         startPage,
         pageSize,
         maxPages,

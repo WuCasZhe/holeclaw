@@ -13,7 +13,8 @@ Use the bundled browser collector and renderer. Keep the workflow read-only and 
 - Accept an explicit inclusive local date range as `--since YYYY-MM-DD --until YYYY-MM-DD`.
 - Accept `评论数大于 N` as `--min-comments N`. The comparison is strictly `reply > N`.
 - Accept `收藏数大于 N` or `关注数大于 N` as `--min-favorites N`. The comparison is strictly `likenum > N`.
-- When both thresholds are present, require both conditions (logical AND).
+- When both thresholds are present, default to both conditions (logical AND). If the user
+  explicitly says "or" / "或者" / "任一", pass `--match-mode any` for logical OR.
 - Default to `--days 30 --min-comments 50` only when the user omits both engagement thresholds. A favorite-only request must not silently add the default comment filter.
 - Reject non-positive days, negative thresholds, an end before a start, and future-only ranges.
 - Warn before scanning a range older than 90 days or a past range far behind the current feed; the API is newest-first and must traverse intervening posts.
@@ -58,6 +59,10 @@ python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-favorites 50
 python3 "$SKILL_DIR/scripts/run_digest.py" run \
   --days 7 --min-comments 100 --min-favorites 50
 
+# Require either threshold (logical OR)
+python3 "$SKILL_DIR/scripts/run_digest.py" run \
+  --days 60 --min-comments 100 --min-favorites 45 --match-mode any
+
 # Inclusive local calendar range
 python3 "$SKILL_DIR/scripts/run_digest.py" run \
   --since 2026-07-01 --until 2026-07-31 --min-comments 80
@@ -89,9 +94,9 @@ Use one persistent browser collector for the whole run. It performs list parsing
 
 The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.
 
-Write the visible checkpoint every `--checkpoint-pages` pages; the default and maximum are 500 pages. SQLite/WAL cache chunks are committed more frequently, and an error flushes the latest durable progress before exit. Re-run the exact same command to resume from `next_page`; a rolling window keeps its first start and end timestamps frozen.
+Write the visible checkpoint every `--checkpoint-pages` pages; the default and maximum are 500 pages. SQLite/WAL cache chunks default to one page so a failure replays at most the current page. An error flushes the latest durable progress before exit. Re-run the exact same command to resume from `next_page`; a rolling window keeps its first start and end timestamps frozen.
 
-Store checkpoints under `output/playwright/holeclaw-checkpoints/` and the shared cache at `output/playwright/holeclaw-cache.sqlite3`, both with mode `0600`. The cache is independent of the report threshold: reuse complete coverage for different thresholds or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Cache coverage created before favorite counts were stored remains reusable for comment-only reports, but favorite-filtered reports must rescan that coverage once to populate `likenum`. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
+Store checkpoints under `output/playwright/holeclaw-checkpoints/` and the shared cache at `output/playwright/holeclaw-cache.sqlite3`, both with mode `0600`. The cache is independent of the report threshold: reuse complete coverage for different thresholds, AND/OR modes, or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Cache coverage created before favorite counts were stored remains reusable for comment-only reports, but favorite-filtered reports must rescan that coverage once to populate `likenum`. If a list favorite count is missing or invalid, fetch only that post's detail once. If the detail also lacks a usable count, record the PID as explicitly unavailable, keep the rest of the favorite coverage reusable, and mention it in the report. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
 
 ### 3. Handle authentication expiry
 
@@ -110,6 +115,8 @@ If `run` reports that the page returned to `iaaa.pku.edu.cn`, repeat `login-open
 - Stop as soon as the collector crosses the requested start time.
 - Honor `Retry-After`; back off on transient fetch/network errors and 429/5xx, then stop after three failed attempts.
 - Do not mass-fetch detail endpoints when list responses already contain the full post text, reply count, and favorite count. Fetch details only when required data is missing.
+- A post with an explicitly unavailable favorite count does not match a favorite threshold. In
+  `--match-mode any`, it may still match the comment threshold.
 - Do not like, follow, comment, publish, or modify account state.
 - Do not auto-save browser authentication after scans; use `login-save` only after an intentional login refresh.
 
@@ -119,7 +126,7 @@ After the script completes, check:
 
 - `reached_start` is true.
 - SQLite `PRAGMA integrity_check` returns `ok` after a network run.
-- Every entry satisfies each requested threshold: `reply > min_comments` and/or `likenum > min_favorites`.
+- Every entry satisfies the requested logic: every threshold in `all` mode, or at least one threshold in `any` mode.
 - PIDs are unique.
 - Entries fall inside the requested time window.
 - The report contains a treehole number and a one-line content summary for every entry.

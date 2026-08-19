@@ -23,7 +23,7 @@ SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 class CliError(RuntimeError):
@@ -153,6 +153,10 @@ def resolve_thresholds(args: argparse.Namespace) -> None:
         raise CliError("--min-comments cannot be negative.")
     if args.min_favorites is not None and args.min_favorites < 0:
         raise CliError("--min-favorites cannot be negative.")
+    if args.match_mode == "any" and (
+        args.min_comments is None or args.min_favorites is None
+    ):
+        raise CliError("--match-mode any requires both --min-comments and --min-favorites.")
 
 
 def window_spec(args: argparse.Namespace) -> dict:
@@ -165,6 +169,8 @@ def window_spec(args: argparse.Namespace) -> dict:
     # Preserve compatibility with checkpoints created before favorite filtering existed.
     if args.min_favorites is not None:
         spec["min_favorites"] = args.min_favorites
+    if args.match_mode != "all":
+        spec["match_mode"] = args.match_mode
     return spec
 
 
@@ -214,6 +220,7 @@ def new_checkpoint(
         "total_scanned": 0,
         "details_requested": 0,
         "matched_by_pid": {},
+        "favorite_unavailable_by_pid": {},
         "favorites_complete": (
             bool(cache_base.get("favorites_complete", False)) if cache_base else True
         ),
@@ -237,6 +244,7 @@ def load_checkpoint(path: Path, spec: dict) -> dict:
     checkpoint.setdefault("scan_start_timestamp", checkpoint["start_timestamp"])
     checkpoint.setdefault("cache_base", None)
     checkpoint.setdefault("favorites_complete", False)
+    checkpoint.setdefault("favorite_unavailable_by_pid", {})
     return checkpoint
 
 
@@ -289,6 +297,15 @@ class CacheStore:
                     source_pages INTEGER NOT NULL,
                     source_scanned INTEGER NOT NULL,
                     favorites_complete INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS favorite_unavailable (
+                    pid TEXT PRIMARY KEY,
+                    observed_at INTEGER NOT NULL,
+                    reason TEXT NOT NULL
                 )
                 """
             )
@@ -389,6 +406,64 @@ class CacheStore:
                 """,
                 values,
             )
+            known_pids = [value[0] for value in values if value[3] is not None]
+            if known_pids:
+                self.connection.executemany(
+                    "DELETE FROM favorite_unavailable WHERE pid = ?",
+                    ((pid,) for pid in known_pids),
+                )
+            self.connection.commit()
+
+    def record_favorite_unavailable(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        observed_at = int(datetime.now(SHANGHAI).timestamp())
+        values = []
+        for row in rows:
+            pid = str(row.get("pid", ""))
+            reason = str(row.get("reason") or "detail_missing")
+            if not pid:
+                raise CliError("Collector returned an invalid unavailable favorite PID.")
+            values.append((pid, observed_at, reason[:120]))
+        with self.lock:
+            self.connection.executemany(
+                """
+                INSERT INTO favorite_unavailable(pid, observed_at, reason)
+                VALUES(?, ?, ?)
+                ON CONFLICT(pid) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    reason=excluded.reason
+                """,
+                values,
+            )
+            self.connection.execute(
+                """
+                DELETE FROM favorite_unavailable
+                WHERE pid IN (SELECT pid FROM posts WHERE favorites IS NOT NULL)
+                """
+            )
+            self.connection.execute(
+                """
+                UPDATE coverage
+                SET favorites_complete = 1
+                WHERE favorites_complete = 0
+                  AND EXISTS (
+                      SELECT 1 FROM posts AS covered
+                      WHERE covered.timestamp >= coverage.start_timestamp
+                        AND covered.timestamp < coverage.end_timestamp
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM posts AS missing
+                      WHERE missing.timestamp >= coverage.start_timestamp
+                        AND missing.timestamp < coverage.end_timestamp
+                        AND missing.favorites IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM favorite_unavailable AS unavailable
+                            WHERE unavailable.pid = missing.pid
+                        )
+                  )
+                """
+            )
             self.connection.commit()
 
     def query_posts(
@@ -397,15 +472,20 @@ class CacheStore:
         end_ts: int,
         min_comments: int | None,
         min_favorites: int | None,
+        match_mode: str = "all",
     ) -> list[dict]:
         filters = ["timestamp >= ?", "timestamp < ?"]
         parameters: list[int] = [start_ts, end_ts]
+        engagement_filters = []
         if min_comments is not None:
-            filters.append("reply > ?")
+            engagement_filters.append("reply > ?")
             parameters.append(min_comments)
         if min_favorites is not None:
-            filters.append("favorites > ?")
+            engagement_filters.append("favorites > ?")
             parameters.append(min_favorites)
+        if engagement_filters:
+            joiner = " OR " if match_mode == "any" else " AND "
+            filters.append(f"({joiner.join(engagement_filters)})")
         with self.lock:
             rows = self.connection.execute(
                 f"""
@@ -415,6 +495,21 @@ class CacheStore:
                 ORDER BY timestamp DESC, pid DESC
                 """,
                 parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def query_favorite_unavailable(self, start_ts: int, end_ts: int) -> list[dict]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                SELECT p.pid, p.timestamp, p.reply, p.type, p.text,
+                       u.observed_at, u.reason
+                FROM favorite_unavailable AS u
+                JOIN posts AS p ON p.pid = u.pid
+                WHERE p.timestamp >= ? AND p.timestamp < ?
+                ORDER BY p.timestamp DESC, p.pid DESC
+                """,
+                (start_ts, end_ts),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -490,12 +585,14 @@ class RunSink:
         checkpoint_path: Path,
         min_comments: int | None,
         min_favorites: int | None,
+        match_mode: str = "all",
     ):
         self.cache = cache
         self.checkpoint = checkpoint
         self.checkpoint_path = checkpoint_path
         self.min_comments = min_comments
         self.min_favorites = min_favorites
+        self.match_mode = match_mode
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.last_progress: dict | None = None
@@ -520,13 +617,28 @@ class RunSink:
 
             rows = payload.get("rows") or []
             matches = payload.get("matches") or []
+            unavailable = payload.get("favorite_unavailable") or []
             if len(rows) != scanned:
                 raise CliError("Collector cache row count does not match scanned count.")
-            missing_favorites = any(row.get("favorites") is None for row in rows)
-            if self.min_favorites is not None and missing_favorites:
-                raise CliError("Collector omitted favorite counts required by the filter.")
+            row_pids = {str(row.get("pid", "")) for row in rows}
+            unavailable_pids = {str(row.get("pid", "")) for row in unavailable}
+            if "" in unavailable_pids or not unavailable_pids.issubset(row_pids):
+                raise CliError("Collector returned invalid unavailable favorite metadata.")
+            missing_favorite_pids = {
+                str(row.get("pid", "")) for row in rows if row.get("favorites") is None
+            }
+            if self.min_favorites is not None and not missing_favorite_pids.issubset(
+                unavailable_pids
+            ):
+                raise CliError("Collector omitted favorite counts or availability metadata.")
             self.cache.upsert_posts(rows)
-            if missing_favorites:
+            self.cache.record_favorite_unavailable(unavailable)
+            for item in unavailable:
+                self.checkpoint["favorite_unavailable_by_pid"][str(item["pid"])] = {
+                    "pid": str(item["pid"]),
+                    "reason": str(item.get("reason") or "detail_missing"),
+                }
+            if missing_favorite_pids and self.min_favorites is None:
                 self.checkpoint["favorites_complete"] = False
 
             report_start = self.checkpoint["start_timestamp"]
@@ -537,14 +649,20 @@ class RunSink:
                 raw_favorites = post.get("favorites")
                 favorites = None if raw_favorites is None else int(raw_favorites)
                 pid = str(post.get("pid", ""))
+                conditions = []
+                if self.min_comments is not None:
+                    conditions.append(reply > self.min_comments)
+                if self.min_favorites is not None:
+                    conditions.append(
+                        favorites is not None and favorites > self.min_favorites
+                    )
+                engagement_match = (
+                    any(conditions) if self.match_mode == "any" else all(conditions)
+                )
                 if (
                     not pid
                     or not (report_start <= timestamp < report_end)
-                    or (self.min_comments is not None and reply <= self.min_comments)
-                    or (
-                        self.min_favorites is not None
-                        and (favorites is None or favorites <= self.min_favorites)
-                    )
+                    or not engagement_match
                 ):
                     raise CliError("Collector returned a post outside the requested filter.")
                 self.checkpoint["matched_by_pid"][pid] = {
@@ -712,12 +830,16 @@ def checkpoint_report_data(checkpoint: dict) -> dict:
         "end_timestamp": checkpoint["end_timestamp"],
         "min_comments": checkpoint["request"]["min_comments"],
         "min_favorites": checkpoint["request"].get("min_favorites"),
+        "match_mode": checkpoint["request"].get("match_mode", "all"),
         "pages": checkpoint["total_pages"],
         "scanned": checkpoint["total_scanned"],
         "details_requested": checkpoint["details_requested"],
         "candidate_count": len(candidates),
         "candidates": candidates,
         "cache_reused": False,
+        "favorite_unavailable": list(
+            checkpoint.get("favorite_unavailable_by_pid", {}).values()
+        ),
     }
 
 
@@ -727,25 +849,30 @@ def cache_report_data(
     end_ts: int,
     min_comments: int | None,
     min_favorites: int | None,
+    match_mode: str,
     collected_at: str,
     pages: int,
     scanned: int,
     details_requested: int,
     cache_reused: bool,
 ) -> dict:
-    candidates = cache.query_posts(start_ts, end_ts, min_comments, min_favorites)
+    candidates = cache.query_posts(
+        start_ts, end_ts, min_comments, min_favorites, match_mode
+    )
     return {
         "collected_at": collected_at,
         "start_timestamp": start_ts,
         "end_timestamp": end_ts,
         "min_comments": min_comments,
         "min_favorites": min_favorites,
+        "match_mode": match_mode,
         "pages": pages,
         "scanned": scanned,
         "details_requested": details_requested,
         "candidate_count": len(candidates),
         "candidates": candidates,
         "cache_reused": cache_reused,
+        "favorite_unavailable": cache.query_favorite_unavailable(start_ts, end_ts),
     }
 
 
@@ -760,7 +887,10 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
     end = datetime.fromtimestamp(data["end_timestamp"], SHANGHAI)
     min_comments = data["min_comments"]
     min_favorites = data["min_favorites"]
-    if min_comments is not None and min_favorites is not None:
+    match_mode = data.get("match_mode", "all")
+    if min_comments is not None and min_favorites is not None and match_mode == "any":
+        title = "北大树洞高评论或高收藏帖报告"
+    elif min_comments is not None and min_favorites is not None:
         title = "北大树洞高评论与高收藏帖报告"
     elif min_favorites is not None:
         title = "北大树洞高收藏帖报告"
@@ -779,13 +909,20 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
         conditions.append(f"收藏数 > {min_favorites}")
     lines.extend(
         [
-            f"- 筛选条件：{' 且 '.join(conditions)}",
+            f"- 筛选条件：{(' 或 ' if match_mode == 'any' else ' 且 ').join(conditions)}",
             f"- 本次网络扫描：{data['pages']} 页，{data['scanned']:,} 条帖子",
             f"- 命中：{data['candidate_count']} 条",
         ]
     )
     if data.get("cache_reused"):
         lines.append("- 数据来源：SQLite 本地缓存（必要的新时间段已增量扫描）")
+    unavailable = data.get("favorite_unavailable") or []
+    if min_favorites is not None and unavailable:
+        unavailable_pids = "、".join(f"#{item['pid']}" for item in unavailable)
+        lines.append(
+            f"- 收藏数不可用：{len(unavailable)} 条（{unavailable_pids}）；"
+            "不按收藏条件命中，但在 OR 模式下仍可按评论条件命中"
+        )
     has_favorite_snapshots = min_favorites is not None or any(
         post.get("favorites") is not None for post in data["candidates"]
     )
@@ -910,6 +1047,7 @@ def run_persistent_collector(
         "end_timestamp": checkpoint["end_timestamp"],
         "min_comments": args.min_comments,
         "min_favorites": args.min_favorites,
+        "match_mode": args.match_mode,
         "start_page": checkpoint["next_page"],
         "page_size": 500,
         "max_pages": remaining,
@@ -1004,7 +1142,9 @@ def run_digest(args: argparse.Namespace) -> None:
     cache_path = (args.cache or default_cache_path()).resolve()
     ensure_runtime_ignored(checkpoint_path, cache_path)
     cache_existed = cache_path.exists()
-    if args.min_favorites is not None and args.min_comments is None:
+    if args.match_mode == "any":
+        report_slug = "high-comments-or-favorites"
+    elif args.min_favorites is not None and args.min_comments is None:
         report_slug = "high-favorites"
     elif args.min_favorites is not None:
         report_slug = "high-comments-and-favorites"
@@ -1082,6 +1222,7 @@ def run_digest(args: argparse.Namespace) -> None:
                         end_ts,
                         args.min_comments,
                         args.min_favorites,
+                        args.match_mode,
                         coverage["completed_at"],
                         0,
                         0,
@@ -1126,6 +1267,7 @@ def run_digest(args: argparse.Namespace) -> None:
                     end_ts,
                     args.min_comments,
                     args.min_favorites,
+                    args.match_mode,
                     covering["completed_at"],
                     0,
                     0,
@@ -1195,7 +1337,8 @@ def run_digest(args: argparse.Namespace) -> None:
         if args.min_favorites is not None:
             conditions.append(f"收藏数 > {args.min_favorites}")
         print(
-            f"开始常驻限速扫描：{window_label}，{' 且 '.join(conditions)}，"
+            f"开始常驻限速扫描：{window_label}，"
+            f"{(' 或 ' if args.match_mode == 'any' else ' 且 ').join(conditions)}，"
             f"单线程 0.6–2 秒间隔，默认每 {args.checkpoint_pages} 页保存检查点。",
             flush=True,
         )
@@ -1205,6 +1348,7 @@ def run_digest(args: argparse.Namespace) -> None:
             checkpoint_path,
             args.min_comments,
             args.min_favorites,
+            args.match_mode,
         )
         server = SinkServer(sink)
         try:
@@ -1242,6 +1386,7 @@ def run_digest(args: argparse.Namespace) -> None:
             end_ts,
             args.min_comments,
             args.min_favorites,
+            args.match_mode,
             checkpoint["completed_at"],
             checkpoint["total_pages"],
             checkpoint["total_scanned"],
@@ -1278,9 +1423,15 @@ def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--min-favorites", type=int, help="Require favorite count to be strictly greater than N"
     )
+    parser.add_argument(
+        "--match-mode",
+        choices=("all", "any"),
+        default="all",
+        help="Require all thresholds (AND) or any threshold (OR)",
+    )
     parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--checkpoint-pages", type=int, default=500)
-    parser.add_argument("--cache-chunk-pages", type=int, default=5)
+    parser.add_argument("--cache-chunk-pages", type=int, default=1)
     parser.add_argument("--max-total-pages", type=int, default=2000)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--cache", type=Path)

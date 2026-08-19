@@ -38,6 +38,21 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(args.min_comments, 100)
         self.assertEqual(args.min_favorites, 50)
 
+    def test_any_match_mode_requires_both_thresholds(self) -> None:
+        args = self.parse_run("--min-comments", "100", "--match-mode", "any")
+        with self.assertRaisesRegex(run_digest.CliError, "requires both"):
+            run_digest.resolve_thresholds(args)
+
+    def test_any_match_mode_is_part_of_checkpoint_spec(self) -> None:
+        args = self.parse_run(
+            "--min-comments", "100", "--min-favorites", "45", "--match-mode", "any"
+        )
+        run_digest.resolve_thresholds(args)
+        self.assertEqual(run_digest.window_spec(args)["match_mode"], "any")
+
+    def test_cache_chunks_default_to_one_page(self) -> None:
+        self.assertEqual(self.parse_run().cache_chunk_pages, 1)
+
     def test_negative_favorite_threshold_is_rejected(self) -> None:
         args = self.parse_run("--min-favorites", "-1")
         with self.assertRaisesRegex(run_digest.CliError, "--min-favorites"):
@@ -181,10 +196,12 @@ class CacheStoreTests(unittest.TestCase):
                 favorite_only = cache.query_posts(90, 110, None, 20)
                 comments_only = cache.query_posts(90, 110, 100, None)
                 combined = cache.query_posts(90, 110, 100, 10)
+                either = cache.query_posts(90, 110, 100, 20, "any")
 
                 self.assertEqual([row["pid"] for row in favorite_only], ["3"])
                 self.assertEqual([row["pid"] for row in comments_only], ["3", "1"])
                 self.assertEqual([row["pid"] for row in combined], ["3"])
+                self.assertEqual([row["pid"] for row in either], ["3", "1"])
             finally:
                 cache.close()
 
@@ -240,6 +257,42 @@ class CacheStoreTests(unittest.TestCase):
             finally:
                 cache.close()
 
+    def test_explicit_unavailable_rows_make_favorite_coverage_reusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = run_digest.CacheStore(Path(directory) / "cache.sqlite3")
+            try:
+                cache.upsert_posts([
+                    {
+                        "pid": "known",
+                        "timestamp": 150,
+                        "reply": 1,
+                        "favorites": 5,
+                        "type": "text",
+                        "text": "known",
+                        "source_page": 1,
+                    },
+                    {
+                        "pid": "missing",
+                        "timestamp": 160,
+                        "reply": 2,
+                        "favorites": None,
+                        "type": "image",
+                        "text": "",
+                        "source_page": 1,
+                    },
+                ])
+                cache.add_coverage(100, 200, "2026-08-12T01:00:00+08:00", 1, 2, False)
+                self.assertIsNone(cache.find_covering(110, 190, require_favorites=True))
+
+                cache.record_favorite_unavailable([
+                    {"pid": "missing", "reason": "detail_missing"}
+                ])
+                self.assertIsNotNone(
+                    cache.find_covering(110, 190, require_favorites=True)
+                )
+            finally:
+                cache.close()
+
 
 class ReportTests(unittest.TestCase):
     def test_favorite_only_report_labels_and_metrics(self) -> None:
@@ -273,6 +326,37 @@ class ReportTests(unittest.TestCase):
         self.assertIn("筛选条件：收藏数 > 10", rendered)
         self.assertIn("5 条评论 · 11 次收藏", rendered)
         self.assertIn("评论数和收藏数为最近一次采集快照", rendered)
+
+    def test_any_report_labels_unavailable_favorites(self) -> None:
+        data = {
+            "collected_at": "2026-08-12T12:00:00+08:00",
+            "start_timestamp": 1_786_422_400,
+            "end_timestamp": 1_786_508_800,
+            "min_comments": 100,
+            "min_favorites": 45,
+            "match_mode": "any",
+            "pages": 1,
+            "scanned": 1,
+            "candidate_count": 1,
+            "candidates": [{
+                "pid": "123",
+                "timestamp": 1_786_465_200,
+                "reply": 101,
+                "favorites": None,
+                "type": "text",
+                "text": "测试帖子",
+            }],
+            "cache_reused": True,
+            "favorite_unavailable": [{"pid": "123", "reason": "detail_missing"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.md"
+            run_digest.render_report(data, output, "近1天")
+            rendered = output.read_text(encoding="utf-8")
+
+        self.assertIn("高评论或高收藏帖报告", rendered)
+        self.assertIn("评论数 > 100 或 收藏数 > 45", rendered)
+        self.assertIn("收藏数不可用：1 条（#123）", rendered)
 
 
 class RunSinkTests(unittest.TestCase):
@@ -348,6 +432,63 @@ class RunSinkTests(unittest.TestCase):
                         }
                     )
                 self.assertEqual(cache.post_count(), 1)
+            finally:
+                cache.close()
+
+    def test_any_filter_accepts_explicitly_unavailable_favorite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 100, "min_favorites": 45, "match_mode": "any"},
+                100,
+                200,
+                100,
+                "test",
+                500,
+                None,
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 100, 45, "any"
+            )
+            try:
+                sink.ingest({
+                    "schema_version": 1,
+                    "start_page": 1,
+                    "end_page": 1,
+                    "pages": 1,
+                    "scanned": 1,
+                    "rows": [{
+                        "pid": "123",
+                        "timestamp": 150,
+                        "reply": 101,
+                        "favorites": None,
+                        "type": "image",
+                        "text": "",
+                        "source_page": 1,
+                    }],
+                    "matches": [{
+                        "pid": "123",
+                        "timestamp": 150,
+                        "reply": 101,
+                        "favorites": None,
+                        "type": "image",
+                        "text": "",
+                    }],
+                    "favorite_unavailable": [
+                        {"pid": "123", "reason": "detail_missing"}
+                    ],
+                })
+                self.assertTrue(checkpoint["favorites_complete"])
+                self.assertIn("123", checkpoint["matched_by_pid"])
+                self.assertEqual(
+                    [row["pid"] for row in cache.query_favorite_unavailable(100, 200)],
+                    ["123"],
+                )
+                self.assertEqual(
+                    [row["pid"] for row in cache.query_posts(100, 200, 100, 45, "any")],
+                    ["123"],
+                )
             finally:
                 cache.close()
 
