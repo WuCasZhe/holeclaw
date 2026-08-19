@@ -1,6 +1,6 @@
 # HoleClaw
 
-HoleClaw 是一个北大树洞只读采集器，它按时间范围、评论数和收藏数阈值顺序读取帖子，并生成 Markdown 报告。它既可以作为 Codex Skill 使用，也可以在终端中由 Playwright 独立自动运行，不调用 AI 或大模型。
+HoleClaw 是一个树洞爬虫，它按时间范围、评论数和收藏数阈值顺序读取帖子，并生成 Markdown 报告。它既可以作为 Codex Skill 使用，也可以在命令行中由 Playwright 独立运行。
 
 ## 工作方式
 
@@ -72,9 +72,7 @@ python3 scripts/run_digest.py run --days 60 \
 
 阈值均为严格大于；两种阈值都不提供时，默认筛选近 30 天评论数大于 50 的帖子。两个阈值默认使用 AND；`--match-mode any` 改为 OR。
 
-采集结果会写入共享 SQLite 缓存。同一时间范围后续更换阈值或 AND/OR 模式时优先本地筛选，只扫描缓存末端之后的新帖子。列表收藏数缺失时只补取该帖详情；详情仍不可用则记录洞号并继续，不会让整页或整段覆盖失效。
-
-## 不使用 AI，由 Playwright 独立运行
+## 由 Playwright 独立运行
 
 直接在终端执行 `standalone`，不需要打开 Codex：
 
@@ -90,7 +88,7 @@ python3 scripts/run_digest.py standalone \
   --min-comments 100 --min-favorites 50
 ```
 
-首次运行时，脚本会打开可视浏览器。用户亲自完成北大统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续；以后有效期内的运行不再需要人工操作。脚本不读取或填写账号密码。
+首次运行时，脚本会打开可视浏览器。用户亲自完成北大统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续
 
 登录状态、SQLite 缓存和检查点默认相对于当前工作目录保存，因此请始终从同一目录运行，或用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 指定固定路径。全局参数需放在 `standalone` 之前，例如：
 
@@ -101,13 +99,7 @@ python3 scripts/run_digest.py \
   --cache /var/lib/holeclaw/cache.sqlite3
 ```
 
-### 计划任务
-
-先交互运行一次完成登录，然后计划任务使用 `--non-interactive`：
-
-```bash
-cd /path/to/holeclaw
-python3 scripts/run_digest.py standalone \
+=
   --days 1 --min-favorites 100 --non-interactive
 ```
 
