@@ -102,7 +102,3 @@ python3 scripts/run_digest.py \
 =
   --days 1 --min-favorites 100 --non-interactive
 ```
-
-`--non-interactive` 会使用无头浏览器，并在登录状态缺失或过期时直接返回错误，不会让 cron/systemd 永久等待输入。定时任务不会自动绕过或刷新北大认证。
-
-独立模式中的报告也是完全确定性生成的：清洗帖子原文并截取一行摘要，不调用 LLM。
