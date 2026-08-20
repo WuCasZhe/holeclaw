@@ -94,13 +94,32 @@ async (page) => {
         const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
         const jitter = () =>
           delayMinMs + Math.floor(Math.random() * (delayMaxMs - delayMinMs + 1));
+        const newTelemetry = () => ({
+          list_requests: 0,
+          detail_requests: 0,
+          request_ms: 0,
+          pacing_ms: 0,
+          retry_backoff_ms: 0,
+          response_chars: 0,
+        });
+        let chunkTelemetry = newTelemetry();
+
+        const pacingSleep = async () => {
+          const milliseconds = jitter();
+          chunkTelemetry.pacing_ms += milliseconds;
+          await sleep(milliseconds);
+        };
 
         const requestJson = async (url, label) => {
           let result = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
+            const startedAt = performance.now();
+            const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
+            chunkTelemetry[requestCounter] += 1;
             try {
               const response = await fetch(url, { headers: authHeaders });
               const text = await response.text();
+              chunkTelemetry.response_chars += text.length;
               let json = null;
               try {
                 json = JSON.parse(text);
@@ -120,6 +139,8 @@ async (page) => {
                 json: null,
                 preview: error?.name || 'NetworkError',
               };
+            } finally {
+              chunkTelemetry.request_ms += Math.max(0, Math.round(performance.now() - startedAt));
             }
 
             const transient =
@@ -127,7 +148,9 @@ async (page) => {
             if (!transient || attempt === 2) break;
             const serverDelay = Number(result.retryAfter || 0) * 1000;
             const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
-            await sleep(Math.min(60_000, backoff));
+            const backoffMilliseconds = Math.min(60_000, backoff);
+            chunkTelemetry.retry_backoff_ms += backoffMilliseconds;
+            await sleep(backoffMilliseconds);
           }
           if (result.status === 401 || result.status === 403) {
             throw new Error(`Authentication expired while loading ${label} (${result.status}).`);
@@ -182,7 +205,7 @@ async (page) => {
 
         for (let offset = 0; offset < maxPages; offset += 1) {
           const pageNumber = startPage + offset;
-          await sleep(jitter());
+          await pacingSleep();
           const listJson = await requestJson(
             `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
             `list page ${pageNumber}`,
@@ -226,7 +249,7 @@ async (page) => {
             (post) => minFavorites !== null && post.favorites === null,
           );
           for (const post of missingFavorites) {
-            await sleep(jitter());
+            await pacingSleep();
             const detailJson = await requestJson(
               `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
               `detail #${post.pid}`,
@@ -274,7 +297,7 @@ async (page) => {
               !detailsFetchedPids.has(post.pid),
           );
           for (const post of missingText) {
-            await sleep(jitter());
+            await pacingSleep();
             const detailJson = await requestJson(
               `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
               `detail #${post.pid}`,
@@ -352,6 +375,7 @@ async (page) => {
               rows: pendingRows,
               matches: pendingMatches,
               favorite_unavailable: pendingUnavailable,
+              telemetry: chunkTelemetry,
             });
             chunkStartPage = pageNumber + 1;
             chunkScanned = 0;
@@ -359,6 +383,7 @@ async (page) => {
             pendingRows = [];
             pendingMatches = [];
             pendingUnavailable = [];
+            chunkTelemetry = newTelemetry();
           }
           if (reachedStart || feedExhausted) break;
         }

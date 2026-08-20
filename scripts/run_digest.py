@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import date, datetime, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +24,16 @@ SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
+TELEMETRY_FIELDS = (
+    "list_requests",
+    "detail_requests",
+    "request_ms",
+    "pacing_ms",
+    "retry_backoff_ms",
+    "response_chars",
+    "cache_write_ms",
+)
 
 
 class CliError(RuntimeError):
@@ -174,6 +184,34 @@ def window_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
+def is_rolling_window(args: argparse.Namespace) -> bool:
+    """Return true only when the window end moves with the current clock."""
+    return args.since is None and args.until is None
+
+
+def should_reuse_checkpoint(args: argparse.Namespace, checkpoint: dict) -> bool:
+    """Resume unfinished work, but never let a completed run freeze a rolling window."""
+    return not checkpoint.get("completed", False) or not is_rolling_window(args)
+
+
+def empty_telemetry() -> dict[str, int]:
+    return {field: 0 for field in TELEMETRY_FIELDS}
+
+
+def merge_telemetry(target: dict, update: dict) -> None:
+    for field in TELEMETRY_FIELDS:
+        raw_value = update.get(field, 0)
+        if isinstance(raw_value, bool):
+            raise CliError("Collector returned invalid telemetry.")
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as error:
+            raise CliError("Collector returned invalid telemetry.") from error
+        if value < 0:
+            raise CliError("Collector returned invalid telemetry.")
+        target[field] = int(target.get(field, 0)) + value
+
+
 def default_checkpoint_path(spec: dict) -> Path:
     fingerprint = hashlib.sha256(
         json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -207,7 +245,7 @@ def new_checkpoint(
 ) -> dict:
     now = datetime.now(SHANGHAI).isoformat()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "request": spec,
         "start_timestamp": start_ts,
         "end_timestamp": end_ts,
@@ -221,6 +259,7 @@ def new_checkpoint(
         "details_requested": 0,
         "matched_by_pid": {},
         "favorite_unavailable_by_pid": {},
+        "telemetry": empty_telemetry(),
         "favorites_complete": (
             bool(cache_base.get("favorites_complete", False)) if cache_base else True
         ),
@@ -237,7 +276,7 @@ def load_checkpoint(path: Path, spec: dict) -> dict:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise CliError(f"Cannot read checkpoint {path}: {error}") from error
-    if checkpoint.get("schema_version") not in (1, 2) or checkpoint.get("request") != spec:
+    if checkpoint.get("schema_version") not in (1, 2, 3) or checkpoint.get("request") != spec:
         raise CliError(
             f"Checkpoint parameters do not match: {path}. Use --fresh to start over."
         )
@@ -245,6 +284,11 @@ def load_checkpoint(path: Path, spec: dict) -> dict:
     checkpoint.setdefault("cache_base", None)
     checkpoint.setdefault("favorites_complete", False)
     checkpoint.setdefault("favorite_unavailable_by_pid", {})
+    checkpoint.setdefault("telemetry", empty_telemetry())
+    if checkpoint["schema_version"] >= 2:
+        checkpoint["matched_by_pid"] = {
+            str(pid): True for pid in checkpoint.get("matched_by_pid", {})
+        }
     return checkpoint
 
 
@@ -281,11 +325,12 @@ class CacheStore:
                 )
                 """
             )
+            self.connection.execute("DROP INDEX IF EXISTS posts_timestamp_idx")
+            self.connection.execute("DROP INDEX IF EXISTS posts_reply_idx")
+            self.connection.execute("DROP INDEX IF EXISTS posts_favorites_idx")
             self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS posts_timestamp_idx ON posts(timestamp)"
-            )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS posts_reply_idx ON posts(reply)"
+                "CREATE INDEX IF NOT EXISTS posts_window_idx "
+                "ON posts(timestamp DESC, pid DESC)"
             )
             self.connection.execute(
                 """
@@ -322,9 +367,6 @@ class CacheStore:
                     "ALTER TABLE coverage ADD COLUMN favorites_complete "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS posts_favorites_idx ON posts(favorites)"
-            )
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS coverage_window_idx "
                 "ON coverage(start_timestamp, end_timestamp)"
@@ -631,8 +673,14 @@ class RunSink:
                 unavailable_pids
             ):
                 raise CliError("Collector omitted favorite counts or availability metadata.")
+            chunk_telemetry = empty_telemetry()
+            merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
+            cache_started = time.perf_counter()
             self.cache.upsert_posts(rows)
             self.cache.record_favorite_unavailable(unavailable)
+            cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
+            chunk_telemetry["cache_write_ms"] = cache_write_ms
+            merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
             for item in unavailable:
                 self.checkpoint["favorite_unavailable_by_pid"][str(item["pid"])] = {
                     "pid": str(item["pid"]),
@@ -665,14 +713,7 @@ class RunSink:
                     or not engagement_match
                 ):
                     raise CliError("Collector returned a post outside the requested filter.")
-                self.checkpoint["matched_by_pid"][pid] = {
-                    "pid": pid,
-                    "timestamp": timestamp,
-                    "reply": reply,
-                    "favorites": favorites,
-                    "type": str(post.get("type") or "text"),
-                    "text": str(post.get("text") or ""),
-                }
+                self.checkpoint["matched_by_pid"][pid] = True
 
             self.checkpoint["next_page"] = end_page + 1
             self.checkpoint["total_pages"] += pages
@@ -979,7 +1020,7 @@ def save_login_state(browser: BrowserCli, state: Path) -> None:
     print(f"登录状态已保存：{state}")
 
 
-def ensure_standalone_login(args: argparse.Namespace) -> None:
+def ensure_standalone_login(args: argparse.Namespace) -> BrowserCli:
     state = args.state.resolve()
     if not state.is_file() and args.non_interactive:
         raise CliError(
@@ -996,7 +1037,7 @@ def ensure_standalone_login(args: argparse.Namespace) -> None:
             browser.run("goto", SITE_URL)
             if authenticated(browser.run("snapshot").stdout):
                 print("已加载有效登录状态，继续自动采集。", flush=True)
-                return
+                return browser
             reason = "已保存的登录状态已失效"
         except CliError:
             reason = "已保存的登录状态无法加载"
@@ -1022,11 +1063,11 @@ def ensure_standalone_login(args: argparse.Namespace) -> None:
     except EOFError as error:
         raise CliError("需要交互式终端完成首次登录。") from error
     save_login_state(browser, state)
+    return browser
 
 
 def run_standalone(args: argparse.Namespace) -> None:
-    ensure_standalone_login(args)
-    run_digest(args)
+    run_digest(args, standalone=True)
 
 
 def run_persistent_collector(
@@ -1125,7 +1166,7 @@ def run_persistent_collector(
     return data
 
 
-def run_digest(args: argparse.Namespace) -> None:
+def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
     resolve_thresholds(args)
     if args.checkpoint_pages <= 0 or args.checkpoint_pages > 500:
         raise CliError("--checkpoint-pages must be between 1 and 500.")
@@ -1159,98 +1200,109 @@ def run_digest(args: argparse.Namespace) -> None:
     try:
         checkpoint = None
         if checkpoint_path.exists() and not args.fresh:
-            checkpoint = load_checkpoint(checkpoint_path, spec)
-            start_ts = checkpoint["start_timestamp"]
-            end_ts = checkpoint["end_timestamp"]
-            window_label = checkpoint["window_label"]
-            checkpoint["checkpoint_pages"] = args.checkpoint_pages
-            if checkpoint["schema_version"] == 1 and not checkpoint["completed"]:
+            candidate = load_checkpoint(checkpoint_path, spec)
+            if not should_reuse_checkpoint(args, candidate):
                 print(
-                    "检测到旧版未完成检查点；为建立完整 SQLite 缓存，"
-                    "将保留冻结时间窗口并从 API 第 1 页重建。",
+                    "已完成的滚动窗口检查点仅作为历史记录；"
+                    "将按当前时间重新规划窗口并复用 SQLite 覆盖。",
                     flush=True,
                 )
-                checkpoint = new_checkpoint(
-                    spec,
-                    start_ts,
-                    end_ts,
-                    start_ts,
-                    window_label,
-                    args.checkpoint_pages,
-                    None,
-                )
-                checkpoint["cache_path"] = str(cache_path)
-                checkpoint["cache_instance_id"] = cache.instance_id
-                write_checkpoint(checkpoint_path, checkpoint)
-            elif checkpoint["schema_version"] == 2:
-                recorded_cache = checkpoint.get("cache_path")
-                if recorded_cache and Path(recorded_cache).resolve() != cache_path:
-                    raise CliError(
-                        "Checkpoint belongs to a different SQLite cache. "
-                        "Use its original --cache path or start with --fresh."
+            else:
+                checkpoint = candidate
+                start_ts = checkpoint["start_timestamp"]
+                end_ts = checkpoint["end_timestamp"]
+                window_label = checkpoint["window_label"]
+                checkpoint["checkpoint_pages"] = args.checkpoint_pages
+                if checkpoint["schema_version"] == 1 and not checkpoint["completed"]:
+                    print(
+                        "检测到旧版未完成检查点；为建立完整 SQLite 缓存，"
+                        "将保留冻结时间窗口并从 API 第 1 页重建。",
+                        flush=True,
                     )
-                if checkpoint["total_pages"] > 0 and not cache_existed:
-                    raise CliError(
-                        "The SQLite cache required by this checkpoint is missing. "
-                        "Restore it or use --fresh."
-                    )
-                recorded_instance = checkpoint.get("cache_instance_id")
-                if recorded_instance and recorded_instance != cache.instance_id:
-                    raise CliError(
-                        "Checkpoint SQLite cache identity does not match. "
-                        "Restore the original cache or use --fresh."
-                    )
-                if (
-                    not recorded_instance
-                    and checkpoint["total_scanned"] > 0
-                    and cache.post_count() == 0
-                ):
-                    raise CliError(
-                        "Checkpoint has progress but the SQLite cache is empty. "
-                        "Restore the original cache or use --fresh."
-                    )
-                checkpoint["cache_path"] = str(cache_path)
-                checkpoint["cache_instance_id"] = cache.instance_id
-            if checkpoint["completed"]:
-                coverage = cache.find_covering(
-                    start_ts, end_ts, require_favorites=args.min_favorites is not None
-                )
-                if coverage:
-                    data = cache_report_data(
-                        cache,
+                    checkpoint = new_checkpoint(
+                        spec,
                         start_ts,
                         end_ts,
-                        args.min_comments,
-                        args.min_favorites,
-                        args.match_mode,
-                        coverage["completed_at"],
-                        0,
-                        0,
-                        0,
-                        True,
+                        start_ts,
+                        window_label,
+                        args.checkpoint_pages,
+                        None,
                     )
-                else:
-                    data = checkpoint_report_data(checkpoint)
-                render_report(data, output, window_label)
+                    checkpoint["cache_path"] = str(cache_path)
+                    checkpoint["cache_instance_id"] = cache.instance_id
+                    write_checkpoint(checkpoint_path, checkpoint)
+                elif checkpoint["schema_version"] >= 2:
+                    recorded_cache = checkpoint.get("cache_path")
+                    if recorded_cache and Path(recorded_cache).resolve() != cache_path:
+                        raise CliError(
+                            "Checkpoint belongs to a different SQLite cache. "
+                            "Use its original --cache path or start with --fresh."
+                        )
+                    if checkpoint["total_pages"] > 0 and not cache_existed:
+                        raise CliError(
+                            "The SQLite cache required by this checkpoint is missing. "
+                            "Restore it or use --fresh."
+                        )
+                    recorded_instance = checkpoint.get("cache_instance_id")
+                    if recorded_instance and recorded_instance != cache.instance_id:
+                        raise CliError(
+                            "Checkpoint SQLite cache identity does not match. "
+                            "Restore the original cache or use --fresh."
+                        )
+                    if (
+                        not recorded_instance
+                        and checkpoint["total_scanned"] > 0
+                        and cache.post_count() == 0
+                    ):
+                        raise CliError(
+                            "Checkpoint has progress but the SQLite cache is empty. "
+                            "Restore it or use --fresh."
+                        )
+                    checkpoint["cache_path"] = str(cache_path)
+                    checkpoint["cache_instance_id"] = cache.instance_id
+                if checkpoint["completed"]:
+                    coverage = cache.find_covering(
+                        start_ts, end_ts, require_favorites=args.min_favorites is not None
+                    )
+                    if coverage or checkpoint["schema_version"] >= 2:
+                        data = cache_report_data(
+                            cache,
+                            start_ts,
+                            end_ts,
+                            args.min_comments,
+                            args.min_favorites,
+                            args.match_mode,
+                            coverage["completed_at"]
+                            if coverage
+                            else checkpoint.get("completed_at", checkpoint["updated_at"]),
+                            0 if coverage else checkpoint["total_pages"],
+                            0 if coverage else checkpoint["total_scanned"],
+                            0,
+                            bool(coverage),
+                        )
+                    else:
+                        data = checkpoint_report_data(checkpoint)
+                    render_report(data, output, window_label)
+                    print(
+                        json.dumps(
+                            {
+                                "report": str(output),
+                                "cache": str(cache_path),
+                                "pages": data["pages"],
+                                "scanned": data["scanned"],
+                                "matched": data["candidate_count"],
+                                "reused_completed_checkpoint": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return
                 print(
-                    json.dumps(
-                        {
-                            "report": str(output),
-                            "cache": str(cache_path),
-                            "pages": data["pages"],
-                            "scanned": data["scanned"],
-                            "matched": data["candidate_count"],
-                            "reused_completed_checkpoint": True,
-                        },
-                        ensure_ascii=False,
-                    )
+                    f"恢复检查点：从 API 第 {checkpoint['next_page']} 页继续，"
+                    f"已累计 {checkpoint['total_pages']} 页 / "
+                    f"{checkpoint['total_scanned']:,} 条。",
+                    flush=True,
                 )
-                return
-            print(
-                f"恢复检查点：从 API 第 {checkpoint['next_page']} 页继续，"
-                f"已累计 {checkpoint['total_pages']} 页 / {checkpoint['total_scanned']:,} 条。",
-                flush=True,
-            )
 
         if checkpoint is None:
             covering = (
@@ -1318,18 +1370,21 @@ def run_digest(args: argparse.Namespace) -> None:
                     flush=True,
                 )
 
-        state = args.state.resolve()
-        if not state.is_file():
-            raise CliError(f"Login state not found: {state}. Run login-open first.")
+        if standalone:
+            browser = ensure_standalone_login(args)
+        else:
+            state = args.state.resolve()
+            if not state.is_file():
+                raise CliError(f"Login state not found: {state}. Run login-open first.")
 
-        browser = BrowserCli(args.session)
-        browser.ensure_session()
-        browser.run("goto", "about:blank")
-        browser.run("state-load", native_path(state))
-        browser.run("goto", SITE_URL)
-        snapshot = browser.run("snapshot").stdout
-        if not authenticated(snapshot):
-            raise CliError("登录已失效或未成功加载，请重新执行 login-open 和 login-save。")
+            browser = BrowserCli(args.session)
+            browser.ensure_session()
+            browser.run("goto", "about:blank")
+            browser.run("state-load", native_path(state))
+            browser.run("goto", SITE_URL)
+            snapshot = browser.run("snapshot").stdout
+            if not authenticated(snapshot):
+                raise CliError("登录已失效或未成功加载，请重新执行 login-open 和 login-save。")
 
         conditions = []
         if args.min_comments is not None:
@@ -1405,6 +1460,7 @@ def run_digest(args: argparse.Namespace) -> None:
                     "matched": data["candidate_count"],
                     "reached_start": checkpoint["reached_start"],
                     "cache_integrity": cache.integrity_check(),
+                    "telemetry": checkpoint["telemetry"],
                 },
                 ensure_ascii=False,
             )

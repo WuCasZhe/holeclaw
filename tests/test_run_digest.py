@@ -3,6 +3,7 @@ import importlib.util
 import sqlite3
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -53,6 +54,20 @@ class ThresholdTests(unittest.TestCase):
     def test_cache_chunks_default_to_one_page(self) -> None:
         self.assertEqual(self.parse_run().cache_chunk_pages, 1)
 
+    def test_completed_checkpoint_does_not_freeze_rolling_window(self) -> None:
+        rolling = self.parse_run("--days", "7", "--min-comments", "100")
+        fixed = self.parse_run(
+            "--days", "7", "--until", "2026-08-18", "--min-comments", "100"
+        )
+        completed = {"completed": True}
+        unfinished = {"completed": False}
+
+        self.assertTrue(run_digest.is_rolling_window(rolling))
+        self.assertFalse(run_digest.should_reuse_checkpoint(rolling, completed))
+        self.assertTrue(run_digest.should_reuse_checkpoint(rolling, unfinished))
+        self.assertFalse(run_digest.is_rolling_window(fixed))
+        self.assertTrue(run_digest.should_reuse_checkpoint(fixed, completed))
+
     def test_negative_favorite_threshold_is_rejected(self) -> None:
         args = self.parse_run("--min-favorites", "-1")
         with self.assertRaisesRegex(run_digest.CliError, "--min-favorites"):
@@ -69,6 +84,32 @@ class ThresholdTests(unittest.TestCase):
             {"favorites_complete": 0},
         )
         self.assertFalse(checkpoint["favorites_complete"])
+        self.assertEqual(checkpoint["schema_version"], 3)
+
+    def test_v2_checkpoint_matches_are_compacted_to_pids_on_load(self) -> None:
+        args = self.parse_run("--min-comments", "50")
+        run_digest.resolve_thresholds(args)
+        spec = run_digest.window_spec(args)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            checkpoint = run_digest.new_checkpoint(
+                spec, 100, 200, 100, "test", 500, None
+            )
+            checkpoint["schema_version"] = 2
+            checkpoint["matched_by_pid"] = {
+                "123": {
+                    "pid": "123",
+                    "timestamp": 150,
+                    "reply": 100,
+                    "favorites": 20,
+                    "type": "text",
+                    "text": "a long post that should not remain in checkpoint state",
+                }
+            }
+            run_digest.write_checkpoint(path, checkpoint)
+            loaded = run_digest.load_checkpoint(path, spec)
+
+        self.assertEqual(loaded["matched_by_pid"], {"123": True})
 
 
 class StandaloneTests(unittest.TestCase):
@@ -153,10 +194,134 @@ class StandaloneTests(unittest.TestCase):
             args.state = state
             with patch.object(run_digest, "BrowserCli", FakeBrowser):
                 with patch("builtins.input", side_effect=AssertionError("must not prompt")):
-                    run_digest.ensure_standalone_login(args)
+                    browser = run_digest.ensure_standalone_login(args)
+        self.assertIsInstance(browser, FakeBrowser)
+
+    def test_standalone_defers_login_until_network_collection(self) -> None:
+        args = self.parse_standalone("--days", "7")
+        with patch.object(run_digest, "run_digest") as digest:
+            run_digest.run_standalone(args)
+        digest.assert_called_once_with(args, standalone=True)
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_standalone_cache_hit_does_not_initialize_browser(self) -> None:
+        day = run_digest.datetime.now(run_digest.SHANGHAI).date() - timedelta(days=1)
+        args = run_digest.build_parser().parse_args([
+            "standalone",
+            "--since", day.isoformat(),
+            "--until", day.isoformat(),
+            "--min-comments", "100",
+        ])
+        run_digest.resolve_thresholds(args)
+        start_ts, end_ts, _label = run_digest.time_window(args)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.cache = root / "cache.sqlite3"
+            args.checkpoint = root / "checkpoint.json"
+            args.output = root / "report.md"
+            cache = run_digest.CacheStore(args.cache)
+            cache.add_coverage(
+                start_ts,
+                end_ts,
+                run_digest.datetime.now(run_digest.SHANGHAI).isoformat(),
+                1,
+                0,
+                True,
+            )
+            cache.close()
+
+            with patch.object(
+                run_digest,
+                "ensure_standalone_login",
+                side_effect=AssertionError("cache hit must not initialize a browser"),
+            ):
+                run_digest.run_standalone(args)
+
+            self.assertTrue(args.output.is_file())
+
+    def test_completed_rolling_checkpoint_advances_to_incremental_scan(self) -> None:
+        args = run_digest.build_parser().parse_args([
+            "standalone", "--days", "7", "--min-comments", "100"
+        ])
+        run_digest.resolve_thresholds(args)
+        spec = run_digest.window_spec(args)
+        current_start, current_end, label = run_digest.time_window(args)
+        old_start = current_start - 3600
+        old_end = current_end - 3600
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.cache = root / "cache.sqlite3"
+            args.checkpoint = root / "checkpoint.json"
+            args.output = root / "report.md"
+            cache = run_digest.CacheStore(args.cache)
+            cache.add_coverage(
+                old_start,
+                old_end,
+                run_digest.datetime.now(run_digest.SHANGHAI).isoformat(),
+                10,
+                5000,
+                True,
+            )
+            checkpoint = run_digest.new_checkpoint(
+                spec, old_start, old_end, old_start, label, 500, None
+            )
+            checkpoint.update({
+                "completed": True,
+                "completed_at": run_digest.datetime.now(run_digest.SHANGHAI).isoformat(),
+                "cache_path": str(args.cache.resolve()),
+                "cache_instance_id": cache.instance_id,
+            })
+            run_digest.write_checkpoint(args.checkpoint, checkpoint)
+            cache.close()
+
+            with patch.object(
+                run_digest,
+                "ensure_standalone_login",
+                side_effect=RuntimeError("network collection reached"),
+            ) as login:
+                with self.assertRaisesRegex(RuntimeError, "network collection reached"):
+                    run_digest.run_standalone(args)
+            login.assert_called_once_with(args)
+
+            advanced = run_digest.load_checkpoint(args.checkpoint, spec)
+            self.assertFalse(advanced["completed"])
+            self.assertGreater(advanced["end_timestamp"], old_end)
+            self.assertEqual(advanced["scan_start_timestamp"], old_end)
 
 
 class CacheStoreTests(unittest.TestCase):
+    def test_cache_uses_one_window_index_for_report_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = run_digest.CacheStore(Path(directory) / "cache.sqlite3")
+            try:
+                indexes = {
+                    row[0]
+                    for row in cache.connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )
+                }
+                self.assertIn("posts_window_idx", indexes)
+                self.assertNotIn("posts_timestamp_idx", indexes)
+                self.assertNotIn("posts_reply_idx", indexes)
+                self.assertNotIn("posts_favorites_idx", indexes)
+                plan = " ".join(
+                    str(row[3])
+                    for row in cache.connection.execute(
+                        """
+                        EXPLAIN QUERY PLAN
+                        SELECT pid, timestamp, reply, favorites, type, text
+                        FROM posts
+                        WHERE timestamp >= ? AND timestamp < ? AND reply > ?
+                        ORDER BY timestamp DESC, pid DESC
+                        """,
+                        (100, 200, 50),
+                    )
+                )
+                self.assertIn("posts_window_idx", plan)
+            finally:
+                cache.close()
     def test_strict_independent_and_combined_filters(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = run_digest.CacheStore(Path(directory) / "cache.sqlite3")
@@ -360,6 +525,56 @@ class ReportTests(unittest.TestCase):
 
 
 class RunSinkTests(unittest.TestCase):
+    def test_ingest_accumulates_collector_and_cache_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 0}, 100, 200, 100, "test", 500, None
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 0, None
+            )
+            try:
+                sink.ingest({
+                    "schema_version": 1,
+                    "start_page": 1,
+                    "end_page": 1,
+                    "pages": 1,
+                    "scanned": 1,
+                    "rows": [{
+                        "pid": "1",
+                        "timestamp": 150,
+                        "reply": 1,
+                        "favorites": 0,
+                        "type": "text",
+                        "text": "telemetry",
+                        "source_page": 1,
+                    }],
+                    "matches": [{
+                        "pid": "1",
+                        "timestamp": 150,
+                        "reply": 1,
+                        "favorites": 0,
+                        "type": "text",
+                        "text": "telemetry",
+                    }],
+                    "telemetry": {
+                        "list_requests": 1,
+                        "request_ms": 250,
+                        "pacing_ms": 600,
+                        "response_chars": 1234,
+                    },
+                })
+                self.assertEqual(checkpoint["telemetry"]["list_requests"], 1)
+                self.assertEqual(checkpoint["telemetry"]["request_ms"], 250)
+                self.assertEqual(checkpoint["telemetry"]["pacing_ms"], 600)
+                self.assertEqual(checkpoint["telemetry"]["response_chars"], 1234)
+                self.assertGreaterEqual(checkpoint["telemetry"]["cache_write_ms"], 0)
+                self.assertEqual(checkpoint["matched_by_pid"], {"1": True})
+            finally:
+                cache.close()
+
     def test_favorite_filter_accepts_matching_rows_and_rejects_missing_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
