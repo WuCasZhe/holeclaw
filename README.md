@@ -1,6 +1,6 @@
 # HoleClaw
 
-HoleClaw 是一个北大树洞只读采集器，它按时间范围、评论数和收藏数阈值顺序读取帖子，并生成 Markdown 报告。它既可以作为 Codex Skill 使用，也可以在终端中由 Playwright 独立自动运行，不调用 AI 或大模型。
+HoleClaw 是一个树洞Claw，它按时间范围、评论数和收藏数阈值顺序读取帖子，并生成 Markdown 报告。它既可以作为 Codex Skill 使用，也可以在命令行中手动执行。
 
 ## 工作方式
 
@@ -53,30 +53,9 @@ $holeclaw 汇总 2026-07-01 到 2026-07-31 评论数大于 100 或者收藏数�
 
 ```
 
-对应命令行参数：
+## 手动执行
 
-```bash
-# 只按评论数筛选
-python3 scripts/run_digest.py run --days 7 --min-comments 100
-
-# 只按收藏数筛选
-python3 scripts/run_digest.py run --days 7 --min-favorites 50
-
-# 两个条件同时满足
-python3 scripts/run_digest.py run --days 30 --min-comments 100 --min-favorites 50
-
-# 两个条件满足任意一个（OR）
-python3 scripts/run_digest.py run --days 60 \
-  --min-comments 100 --min-favorites 45 --match-mode any
-```
-
-阈值均为严格大于；两种阈值都不提供时，默认筛选近 30 天评论数大于 50 的帖子。两个阈值默认使用 AND；`--match-mode any` 改为 OR。
-
-采集结果会写入共享 SQLite 缓存。同一时间范围后续更换阈值或 AND/OR 模式时优先本地筛选，只扫描缓存末端之后的新帖子。列表收藏数缺失时只补取该帖详情；详情仍不可用则记录洞号并继续，不会让整页或整段覆盖失效。
-
-## 不使用 AI，由 Playwright 独立运行
-
-直接在终端执行 `standalone`，不需要打开 Codex：
+直接在命令行加上 `standalone`：
 
 ```bash
 cd /path/to/holeclaw
@@ -90,7 +69,7 @@ python3 scripts/run_digest.py standalone \
   --min-comments 100 --min-favorites 50
 ```
 
-首次运行时，脚本会打开可视浏览器。用户亲自完成北大统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续；以后有效期内的运行不再需要人工操作。脚本不读取或填写账号密码。
+首次运行时，脚本会打开可视浏览器。用户亲自完成统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续
 
 登录状态、SQLite 缓存和检查点默认相对于当前工作目录保存，因此请始终从同一目录运行，或用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 指定固定路径。全局参数需放在 `standalone` 之前，例如：
 
@@ -100,24 +79,3 @@ python3 scripts/run_digest.py \
   standalone --days 1 --min-comments 100 \
   --cache /var/lib/holeclaw/cache.sqlite3
 ```
-
-### 计划任务
-
-先交互运行一次完成登录，然后计划任务使用 `--non-interactive`：
-
-```bash
-cd /path/to/holeclaw
-python3 scripts/run_digest.py standalone \
-  --days 1 --min-favorites 100 --non-interactive
-```
-
-`--non-interactive` 会使用无头浏览器，并在登录状态缺失或过期时直接返回错误，不会让 cron/systemd 永久等待输入。定时任务不会自动绕过或刷新北大认证。
-
-独立模式中的报告也是完全确定性生成的：清洗帖子原文并截取一行摘要，不调用 LLM。
-
-## 增量、恢复与性能数据
-
-- 未完成任务会冻结当次时间窗口，重跑后继续扫描。
-- 已完成的 `--days N` 任务不会冻结下一次滚动窗口；下次运行会复用 SQLite 历史覆盖，只扫新增头部。
-- checkpoint 只保留命中 PID、进度和计数，完整帖子内容以 SQLite 为准。
-- 网络运行结束后的 JSON 输出包含 `telemetry`，可区分 API 请求、限速等待、重试退避、响应规模和 SQLite 写入耗时。
