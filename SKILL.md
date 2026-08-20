@@ -1,6 +1,6 @@
 ---
 name: holeclaw
-description: HoleClaw performs rate-limited, sequential, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment or high-favorite posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子", "收藏数大于 50 的树洞", or "树洞高评论日报".
+description: HoleClaw performs rate-limited, bounded-concurrency, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment or high-favorite posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子", "收藏数大于 50 的树洞", or "树洞高评论日报".
 ---
 
 # HoleClaw
@@ -90,7 +90,7 @@ If the saved state is missing or expired, standalone mode opens a headed browser
 
 For cron/systemd after the initial interactive login, add `--non-interactive`. This uses a headless browser and makes missing or expired login state fail immediately instead of waiting on stdin. Always use a stable working directory or explicit `--state`, `--cache`, `--checkpoint`, and `--output` paths so scheduled runs reuse the intended state and cache. Global `--state` and `--session` options must appear before the `standalone` subcommand.
 
-Use one persistent browser collector for the whole run. It performs list parsing and time/comment/favorite filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint.
+Use one persistent browser collector for the whole run. It performs list parsing and time/comment/favorite filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint. Requests use bounded concurrency (`--concurrency 1..4`, default `2`), while completed pages are buffered and committed to the sink strictly in page order.
 
 The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.
 
@@ -108,12 +108,13 @@ If `run` reports that the page returned to `iaaa.pku.edu.cn`, repeat `login-open
 
 - Keep the bundled fixed page size and 0.6–2 second jitter; do not lower the delay.
 - Keep the checkpoint interval at or below 500 pages and the default total safety ceiling at 2,000 pages.
-- Keep one persistent collector process and send no concurrent Treehole requests.
+- Keep one persistent collector process and cap concurrent Treehole requests at 4.
 - Keep progress/completion event-driven through the localhost sink; never poll with extra Playwright CLI calls.
 - Filter requested comment/favorite matches inside the browser request process; send cache chunks only to the tokenized `127.0.0.1` sink.
 - Save accumulated PIDs, counts, and `next_page` atomically at checkpoint boundaries and on errors.
 - Store all list rows in SQLite/WAL so later thresholds and covered time ranges can be rendered without rescanning.
-- Send requests sequentially with no concurrency.
+- Commit cache chunks and advance `next_page` only across a contiguous ordered page range, regardless of request completion order.
+- Share `Retry-After` cooldown across all concurrent workers; never let each worker create an independent retry storm.
 - Stop as soon as the collector crosses the requested start time.
 - Honor `Retry-After`; back off on transient fetch/network errors and 429/5xx, then stop after three failed attempts.
 - Do not mass-fetch detail endpoints when list responses already contain the full post text, reply count, and favorite count. Fetch details only when required data is missing.

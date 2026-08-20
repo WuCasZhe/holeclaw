@@ -67,6 +67,10 @@ python3 scripts/run_digest.py standalone --days 7 --min-favorites 50
 python3 scripts/run_digest.py standalone \
   --since 2026-08-01 --until 2026-08-07 \
   --min-comments 100 --min-favorites 50
+
+# 使用 1–4 的有限并发；默认值为 2
+python3 scripts/run_digest.py standalone \
+  --days 7 --min-comments 100 --concurrency 4
 ```
 
 首次运行时，脚本会打开可视浏览器。用户亲自完成统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续

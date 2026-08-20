@@ -54,6 +54,22 @@ class ThresholdTests(unittest.TestCase):
     def test_cache_chunks_default_to_one_page(self) -> None:
         self.assertEqual(self.parse_run().cache_chunk_pages, 1)
 
+    def test_request_concurrency_defaults_to_two_and_is_configurable(self) -> None:
+        self.assertEqual(self.parse_run().concurrency, 2)
+        self.assertEqual(self.parse_run("--concurrency", "4").concurrency, 4)
+
+    def test_request_concurrency_rejects_values_above_safety_cap(self) -> None:
+        args = self.parse_run("--concurrency", "5")
+        with self.assertRaisesRegex(run_digest.CliError, "--concurrency"):
+            run_digest.run_digest(args)
+
+    def test_max_telemetry_fields_are_not_summed(self) -> None:
+        telemetry = run_digest.empty_telemetry()
+        run_digest.merge_telemetry(telemetry, {"max_in_flight": 2, "wall_ms": 10})
+        run_digest.merge_telemetry(telemetry, {"max_in_flight": 1, "wall_ms": 20})
+        self.assertEqual(telemetry["max_in_flight"], 2)
+        self.assertEqual(telemetry["wall_ms"], 30)
+
     def test_completed_checkpoint_does_not_freeze_rolling_window(self) -> None:
         rolling = self.parse_run("--days", "7", "--min-comments", "100")
         fixed = self.parse_run(
@@ -525,6 +541,85 @@ class ReportTests(unittest.TestCase):
 
 
 class RunSinkTests(unittest.TestCase):
+    def test_cache_chunk_rolls_back_when_second_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 10}, 100, 200, 100, "test", 500, None
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 10, None
+            )
+            payload = {
+                "schema_version": 1,
+                "start_page": 1,
+                "end_page": 1,
+                "pages": 1,
+                "scanned": 1,
+                "rows": [{
+                    "pid": "rollback",
+                    "timestamp": 150,
+                    "reply": 1,
+                    "favorites": 0,
+                    "type": "text",
+                    "text": "must roll back",
+                    "source_page": 1,
+                }],
+                "matches": [],
+            }
+            try:
+                with patch.object(
+                    cache,
+                    "record_favorite_unavailable",
+                    side_effect=RuntimeError("simulated second write failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "second write failure"):
+                        sink.ingest(payload)
+                self.assertEqual(cache.post_count(), 0)
+                self.assertEqual(checkpoint["next_page"], 1)
+            finally:
+                cache.close()
+
+    def test_invalid_match_is_rejected_before_cache_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 0}, 100, 200, 100, "test", 500, None
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 0, None
+            )
+            try:
+                with self.assertRaisesRegex(run_digest.CliError, "outside the requested"):
+                    sink.ingest({
+                        "schema_version": 1,
+                        "start_page": 1,
+                        "end_page": 1,
+                        "pages": 1,
+                        "scanned": 1,
+                        "rows": [{
+                            "pid": "1",
+                            "timestamp": 150,
+                            "reply": 1,
+                            "favorites": 0,
+                            "type": "text",
+                            "text": "valid cache row",
+                            "source_page": 1,
+                        }],
+                        "matches": [{
+                            "pid": "1",
+                            "timestamp": 250,
+                            "reply": 1,
+                            "favorites": 0,
+                        }],
+                    })
+                self.assertEqual(cache.post_count(), 0)
+                self.assertEqual(checkpoint["next_page"], 1)
+            finally:
+                cache.close()
+
     def test_ingest_accumulates_collector_and_cache_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

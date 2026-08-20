@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,7 +34,13 @@ TELEMETRY_FIELDS = (
     "retry_backoff_ms",
     "response_chars",
     "cache_write_ms",
+    "wall_ms",
+    "throttle_responses",
+    "concurrency_reductions",
+    "max_in_flight",
+    "overfetch_pages",
 )
+TELEMETRY_MAX_FIELDS = {"max_in_flight"}
 
 
 class CliError(RuntimeError):
@@ -209,7 +216,10 @@ def merge_telemetry(target: dict, update: dict) -> None:
             raise CliError("Collector returned invalid telemetry.") from error
         if value < 0:
             raise CliError("Collector returned invalid telemetry.")
-        target[field] = int(target.get(field, 0)) + value
+        if field in TELEMETRY_MAX_FIELDS:
+            target[field] = max(int(target.get(field, 0)), value)
+        else:
+            target[field] = int(target.get(field, 0)) + value
 
 
 def default_checkpoint_path(spec: dict) -> Path:
@@ -311,6 +321,13 @@ class CacheStore:
                 )
                 """
             )
+            schema_row = self.connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            try:
+                previous_schema_version = int(schema_row[0]) if schema_row else 0
+            except (TypeError, ValueError):
+                previous_schema_version = 0
             self.connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS posts (
@@ -325,9 +342,10 @@ class CacheStore:
                 )
                 """
             )
-            self.connection.execute("DROP INDEX IF EXISTS posts_timestamp_idx")
-            self.connection.execute("DROP INDEX IF EXISTS posts_reply_idx")
-            self.connection.execute("DROP INDEX IF EXISTS posts_favorites_idx")
+            if previous_schema_version < 4:
+                self.connection.execute("DROP INDEX IF EXISTS posts_timestamp_idx")
+                self.connection.execute("DROP INDEX IF EXISTS posts_reply_idx")
+                self.connection.execute("DROP INDEX IF EXISTS posts_favorites_idx")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS posts_window_idx "
                 "ON posts(timestamp DESC, pid DESC)"
@@ -395,7 +413,19 @@ class CacheStore:
             self.connection.close()
         self.path.chmod(0o600)
 
-    def upsert_posts(self, rows: list[dict]) -> None:
+    @contextmanager
+    def transaction(self):
+        """Serialize a cache chunk and commit it as one SQLite transaction."""
+        with self.lock:
+            try:
+                yield
+            except Exception:
+                self.connection.rollback()
+                raise
+            else:
+                self.connection.commit()
+
+    def upsert_posts(self, rows: list[dict], *, commit: bool = True) -> None:
         if not rows:
             return
         observed_at = int(datetime.now(SHANGHAI).timestamp())
@@ -454,9 +484,12 @@ class CacheStore:
                     "DELETE FROM favorite_unavailable WHERE pid = ?",
                     ((pid,) for pid in known_pids),
                 )
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
 
-    def record_favorite_unavailable(self, rows: list[dict]) -> None:
+    def record_favorite_unavailable(
+        self, rows: list[dict], *, commit: bool = True
+    ) -> None:
         if not rows:
             return
         observed_at = int(datetime.now(SHANGHAI).timestamp())
@@ -506,7 +539,8 @@ class CacheStore:
                   )
                 """
             )
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
 
     def query_posts(
         self,
@@ -663,9 +697,12 @@ class RunSink:
             if len(rows) != scanned:
                 raise CliError("Collector cache row count does not match scanned count.")
             row_pids = {str(row.get("pid", "")) for row in rows}
+            match_pids = {str(row.get("pid", "")) for row in matches}
             unavailable_pids = {str(row.get("pid", "")) for row in unavailable}
             if "" in unavailable_pids or not unavailable_pids.issubset(row_pids):
                 raise CliError("Collector returned invalid unavailable favorite metadata.")
+            if "" in match_pids or not match_pids.issubset(row_pids):
+                raise CliError("Collector returned matches outside its cache rows.")
             missing_favorite_pids = {
                 str(row.get("pid", "")) for row in rows if row.get("favorites") is None
             }
@@ -673,24 +710,10 @@ class RunSink:
                 unavailable_pids
             ):
                 raise CliError("Collector omitted favorite counts or availability metadata.")
-            chunk_telemetry = empty_telemetry()
-            merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
-            cache_started = time.perf_counter()
-            self.cache.upsert_posts(rows)
-            self.cache.record_favorite_unavailable(unavailable)
-            cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
-            chunk_telemetry["cache_write_ms"] = cache_write_ms
-            merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            for item in unavailable:
-                self.checkpoint["favorite_unavailable_by_pid"][str(item["pid"])] = {
-                    "pid": str(item["pid"]),
-                    "reason": str(item.get("reason") or "detail_missing"),
-                }
-            if missing_favorite_pids and self.min_favorites is None:
-                self.checkpoint["favorites_complete"] = False
 
             report_start = self.checkpoint["start_timestamp"]
             report_end = self.checkpoint["end_timestamp"]
+            validated_match_pids = []
             for post in matches:
                 timestamp = int(post.get("timestamp", 0))
                 reply = int(post.get("reply", 0))
@@ -713,12 +736,34 @@ class RunSink:
                     or not engagement_match
                 ):
                     raise CliError("Collector returned a post outside the requested filter.")
+                validated_match_pids.append(pid)
+
+            details_requested = int(payload.get("details_requested", 0))
+            if details_requested < 0:
+                raise CliError("Collector returned an invalid detail-request count.")
+            chunk_telemetry = empty_telemetry()
+            merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
+            cache_started = time.perf_counter()
+            with self.cache.transaction():
+                self.cache.upsert_posts(rows, commit=False)
+                self.cache.record_favorite_unavailable(unavailable, commit=False)
+            cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
+            chunk_telemetry["cache_write_ms"] = cache_write_ms
+            merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
+            for item in unavailable:
+                self.checkpoint["favorite_unavailable_by_pid"][str(item["pid"])] = {
+                    "pid": str(item["pid"]),
+                    "reason": str(item.get("reason") or "detail_missing"),
+                }
+            if missing_favorite_pids and self.min_favorites is None:
+                self.checkpoint["favorites_complete"] = False
+            for pid in validated_match_pids:
                 self.checkpoint["matched_by_pid"][pid] = True
 
             self.checkpoint["next_page"] = end_page + 1
             self.checkpoint["total_pages"] += pages
             self.checkpoint["total_scanned"] += scanned
-            self.checkpoint["details_requested"] += int(payload.get("details_requested", 0))
+            self.checkpoint["details_requested"] += details_requested
             self.checkpoint["reached_start"] = bool(payload.get("reached_start"))
             self.checkpoint["feed_exhausted"] = bool(payload.get("feed_exhausted"))
             self.checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
@@ -1095,6 +1140,7 @@ def run_persistent_collector(
         "pages_before": checkpoint["total_pages"],
         "checkpoint_pages": args.checkpoint_pages,
         "cache_chunk_pages": args.cache_chunk_pages,
+        "request_concurrency": args.concurrency,
         "delay_min_ms": 600,
         "delay_max_ms": 2000,
         "sink_url": sink_url,
@@ -1174,6 +1220,8 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         raise CliError("--cache-chunk-pages must be between 1 and 20.")
     if args.max_total_pages <= 0 or args.max_total_pages > 5000:
         raise CliError("--max-total-pages must be between 1 and 5000.")
+    if args.concurrency <= 0 or args.concurrency > 4:
+        raise CliError("--concurrency must be between 1 and 4.")
     if args.max_pages is not None:
         print("提示：--max-pages 已由常驻采集器取代；请使用 --max-total-pages。", flush=True)
 
@@ -1392,9 +1440,10 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         if args.min_favorites is not None:
             conditions.append(f"收藏数 > {args.min_favorites}")
         print(
-            f"开始常驻限速扫描：{window_label}，"
+            f"开始常驻有限并发扫描：{window_label}，"
             f"{(' 或 ' if args.match_mode == 'any' else ' 且 ').join(conditions)}，"
-            f"单线程 0.6–2 秒间隔，默认每 {args.checkpoint_pages} 页保存检查点。",
+            f"并发度 {args.concurrency}，每个请求 0.6–2 秒抖动，"
+            f"默认每 {args.checkpoint_pages} 页保存检查点。",
             flush=True,
         )
         sink = RunSink(
@@ -1488,6 +1537,12 @@ def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--checkpoint-pages", type=int, default=500)
     parser.add_argument("--cache-chunk-pages", type=int, default=1)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=2,
+        help="Bounded Treehole request concurrency (1-4; default: 2)",
+    )
     parser.add_argument("--max-total-pages", type=int, default=2000)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--cache", type=Path)

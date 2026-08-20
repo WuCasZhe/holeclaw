@@ -21,6 +21,7 @@ async (page) => {
     pages_before: pagesBefore = 0,
     checkpoint_pages: checkpointPages = 500,
     cache_chunk_pages: cacheChunkPages = 5,
+    request_concurrency: requestConcurrency = 2,
     delay_min_ms: delayMinMs = 600,
     delay_max_ms: delayMaxMs = 2000,
     sink_url: sinkUrl,
@@ -40,6 +41,9 @@ async (page) => {
     !Number.isInteger(cacheChunkPages) ||
     cacheChunkPages < 1 ||
     cacheChunkPages > 20 ||
+    !Number.isInteger(requestConcurrency) ||
+    requestConcurrency < 1 ||
+    requestConcurrency > 4 ||
     pageSize !== 500 ||
     delayMinMs !== 600 ||
     delayMaxMs !== 2000 ||
@@ -87,6 +91,7 @@ async (page) => {
         pagesBefore,
         checkpointPages,
         cacheChunkPages,
+        requestConcurrency,
         delayMinMs,
         delayMaxMs,
         sinkUrl,
@@ -101,8 +106,17 @@ async (page) => {
           pacing_ms: 0,
           retry_backoff_ms: 0,
           response_chars: 0,
+          wall_ms: 0,
+          throttle_responses: 0,
+          concurrency_reductions: 0,
+          max_in_flight: 0,
+          overfetch_pages: 0,
         });
         let chunkTelemetry = newTelemetry();
+        let chunkWallStartedAt = performance.now();
+        let activeRequests = 0;
+        let cooldownUntil = 0;
+        let effectiveConcurrency = requestConcurrency;
 
         const pacingSleep = async () => {
           const milliseconds = jitter();
@@ -110,12 +124,26 @@ async (page) => {
           await sleep(milliseconds);
         };
 
+        const waitForSharedCooldown = async () => {
+          while (cooldownUntil > Date.now()) {
+            const milliseconds = cooldownUntil - Date.now();
+            chunkTelemetry.retry_backoff_ms += milliseconds;
+            await sleep(milliseconds);
+          }
+        };
+
         const requestJson = async (url, label) => {
           let result = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
+            await waitForSharedCooldown();
             const startedAt = performance.now();
             const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
             chunkTelemetry[requestCounter] += 1;
+            activeRequests += 1;
+            chunkTelemetry.max_in_flight = Math.max(
+              chunkTelemetry.max_in_flight,
+              activeRequests,
+            );
             try {
               const response = await fetch(url, { headers: authHeaders });
               const text = await response.text();
@@ -140,17 +168,24 @@ async (page) => {
                 preview: error?.name || 'NetworkError',
               };
             } finally {
+              activeRequests -= 1;
               chunkTelemetry.request_ms += Math.max(0, Math.round(performance.now() - startedAt));
             }
 
             const transient =
               result.status === 0 || result.status === 429 || result.status >= 500;
+            if (result.status === 429) {
+              chunkTelemetry.throttle_responses += 1;
+              if (effectiveConcurrency > 1) {
+                effectiveConcurrency -= 1;
+                chunkTelemetry.concurrency_reductions += 1;
+              }
+            }
             if (!transient || attempt === 2) break;
             const serverDelay = Number(result.retryAfter || 0) * 1000;
             const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
             const backoffMilliseconds = Math.min(60_000, backoff);
-            chunkTelemetry.retry_backoff_ms += backoffMilliseconds;
-            await sleep(backoffMilliseconds);
+            cooldownUntil = Math.max(cooldownUntil, Date.now() + backoffMilliseconds);
           }
           if (result.status === 401 || result.status === 403) {
             throw new Error(`Authentication expired while loading ${label} (${result.status}).`);
@@ -161,6 +196,21 @@ async (page) => {
             );
           }
           return result.json;
+        };
+
+        const mapLimit = async (items, limit, worker) => {
+          let nextIndex = 0;
+          const runners = Array.from(
+            { length: Math.min(limit, items.length) },
+            async () => {
+              while (nextIndex < items.length) {
+                const currentIndex = nextIndex;
+                nextIndex += 1;
+                await worker(items[currentIndex], currentIndex);
+              }
+            },
+          );
+          await Promise.all(runners);
         };
 
         const sendToSink = async (payload) => {
@@ -203,189 +253,210 @@ async (page) => {
           return matchMode === 'any' ? conditions.some(Boolean) : conditions.every(Boolean);
         };
 
-        for (let offset = 0; offset < maxPages; offset += 1) {
-          const pageNumber = startPage + offset;
-          await pacingSleep();
-          const listJson = await requestJson(
-            `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
-            `list page ${pageNumber}`,
+        while (pages < maxPages && !reachedStart && !feedExhausted) {
+          const batchSize = Math.min(effectiveConcurrency, maxPages - pages);
+          const firstBatchPage = startPage + pages;
+          const pageNumbers = Array.from(
+            { length: batchSize },
+            (_value, index) => firstBatchPage + index,
           );
-          const posts = listJson?.data?.list || [];
-          pages += 1;
-          lastPage = pageNumber;
-          scanned += posts.length;
-          chunkScanned += posts.length;
+          const pageResults = await Promise.all(
+            pageNumbers.map(async (pageNumber) => {
+              await pacingSleep();
+              const listJson = await requestJson(
+                `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
+                `list page ${pageNumber}`,
+              );
+              return { pageNumber, posts: listJson?.data?.list || [] };
+            }),
+          );
 
-          if (!posts.length) {
-            feedExhausted = true;
-            reachedStart = true;
-          }
+          for (let batchIndex = 0; batchIndex < pageResults.length; batchIndex += 1) {
+            const { pageNumber, posts } = pageResults[batchIndex];
+            pages += 1;
+            lastPage = pageNumber;
+            scanned += posts.length;
+            chunkScanned += posts.length;
 
-          const rowsByPid = new Map();
-          const detailsFetchedPids = new Set();
-          for (const post of posts) {
-            const rawFavorites = post.likenum;
-            let favorites =
-              rawFavorites === null || rawFavorites === undefined || rawFavorites === ''
-                ? null
-                : Number(rawFavorites);
-            if (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) {
-              favorites = null;
+            if (!posts.length) {
+              feedExhausted = true;
+              reachedStart = true;
             }
-            const row = {
-              pid: String(post.pid),
-              timestamp: Number(post.timestamp),
-              reply: Number(post.reply),
-              favorites,
-              type: post.type || 'text',
-              text: post.text || '',
-              source_page: pageNumber,
-            };
-            rowsByPid.set(row.pid, row);
-            pendingRows.push(row);
-          }
 
-          const missingFavorites = [...rowsByPid.values()].filter(
-            (post) => minFavorites !== null && post.favorites === null,
-          );
-          for (const post of missingFavorites) {
-            await pacingSleep();
-            const detailJson = await requestJson(
-              `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
-              `detail #${post.pid}`,
+            const rowsByPid = new Map();
+            const detailsFetchedPids = new Set();
+            for (const post of posts) {
+              const rawFavorites = post.likenum;
+              let favorites =
+                rawFavorites === null || rawFavorites === undefined || rawFavorites === ''
+                  ? null
+                  : Number(rawFavorites);
+              if (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) {
+                favorites = null;
+              }
+              const row = {
+                pid: String(post.pid),
+                timestamp: Number(post.timestamp),
+                reply: Number(post.reply),
+                favorites,
+                type: post.type || 'text',
+                text: post.text || '',
+                source_page: pageNumber,
+              };
+              rowsByPid.set(row.pid, row);
+              pendingRows.push(row);
+            }
+
+            const missingFavorites = [...rowsByPid.values()].filter(
+              (post) => minFavorites !== null && post.favorites === null,
             );
-            const hole = detailJson?.data?.hole || {};
-            const rawDetailFavorites = hole.likenum;
-            let detailFavorites =
-              rawDetailFavorites === null ||
-              rawDetailFavorites === undefined ||
-              rawDetailFavorites === ''
-                ? null
-                : Number(rawDetailFavorites);
-            if (
-              detailFavorites !== null &&
-              (!Number.isInteger(detailFavorites) || detailFavorites < 0)
-            ) {
-              detailFavorites = null;
-            }
-            post.text = hole.text || post.text;
-            post.type = hole.type || post.type;
-            post.reply = Number(hole.reply ?? post.reply);
-            post.favorites = detailFavorites;
-            detailsFetchedPids.add(post.pid);
-            if (detailFavorites === null) {
-              pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
-            }
-            detailsRequested += 1;
-            chunkDetails += 1;
-          }
-
-          for (const row of rowsByPid.values()) {
-            if (
-              row.timestamp >= reportStartTimestamp &&
-              row.timestamp < endTimestamp &&
-              matchesThresholds(row)
-            ) {
-              pendingMatches.push({ ...row });
-            }
-          }
-
-          const missingText = pendingMatches.filter(
-            (post) =>
-              post.source_page === pageNumber &&
-              !post.text.trim() &&
-              !detailsFetchedPids.has(post.pid),
-          );
-          for (const post of missingText) {
-            await pacingSleep();
-            const detailJson = await requestJson(
-              `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
-              `detail #${post.pid}`,
-            );
-            const hole = detailJson?.data?.hole || {};
-            post.text = hole.text || post.text;
-            post.type = hole.type || post.type;
-            post.reply = Number(hole.reply ?? post.reply);
-            let detailFavorites =
-              hole.likenum === null || hole.likenum === undefined || hole.likenum === ''
-                ? post.favorites
-                : Number(hole.likenum);
-            if (
-              detailFavorites !== null &&
-              (!Number.isInteger(detailFavorites) || detailFavorites < 0)
-            ) {
-              detailFavorites = post.favorites;
-            }
-            post.favorites = detailFavorites;
-            if (
-              minFavorites !== null &&
-              detailFavorites === null &&
-              !pendingUnavailable.some((item) => item.pid === post.pid)
-            ) {
-              pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
-            }
-            const cached = rowsByPid.get(post.pid);
-            if (cached) {
-              cached.text = post.text;
-              cached.type = post.type;
-              cached.reply = post.reply;
-              cached.favorites = post.favorites;
-            }
-            detailsRequested += 1;
-            chunkDetails += 1;
-          }
-          pendingMatches = pendingMatches.filter(
-            (post) => post.source_page !== pageNumber || matchesThresholds(post),
-          );
-
-          const oldest = Number(posts.at(-1)?.timestamp || 0);
-          if (oldest && oldest < scanStartTimestamp) reachedStart = true;
-          const terminal = reachedStart || feedExhausted || offset + 1 === maxPages;
-          const checkpoint =
-            (pagesBefore + pages) % checkpointPages === 0 || terminal;
-          const chunkFull = pages % cacheChunkPages === 0;
-
-          if (chunkFull || terminal || checkpoint) {
-            const result = terminal
-              ? {
-                  collected_at: new Date().toISOString(),
-                  batch_start_page: startPage,
-                  batch_end_page: pageNumber,
-                  next_page: pageNumber + 1,
-                  pages,
-                  scanned,
-                  details_requested: detailsRequested,
-                  reached_start: reachedStart,
-                  feed_exhausted: feedExhausted,
-                }
-              : null;
-            await sendToSink({
-              schema_version: 1,
-              start_page: chunkStartPage,
-              end_page: pageNumber,
-              pages: pageNumber - chunkStartPage + 1,
-              scanned: chunkScanned,
-              details_requested: chunkDetails,
-              oldest,
-              reached_start: reachedStart,
-              feed_exhausted: feedExhausted,
-              checkpoint,
-              terminal,
-              result,
-              rows: pendingRows,
-              matches: pendingMatches,
-              favorite_unavailable: pendingUnavailable,
-              telemetry: chunkTelemetry,
+            await mapLimit(missingFavorites, effectiveConcurrency, async (post) => {
+              await pacingSleep();
+              const detailJson = await requestJson(
+                `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
+                `detail #${post.pid}`,
+              );
+              const hole = detailJson?.data?.hole || {};
+              const rawDetailFavorites = hole.likenum;
+              let detailFavorites =
+                rawDetailFavorites === null ||
+                rawDetailFavorites === undefined ||
+                rawDetailFavorites === ''
+                  ? null
+                  : Number(rawDetailFavorites);
+              if (
+                detailFavorites !== null &&
+                (!Number.isInteger(detailFavorites) || detailFavorites < 0)
+              ) {
+                detailFavorites = null;
+              }
+              post.text = hole.text || post.text;
+              post.type = hole.type || post.type;
+              post.reply = Number(hole.reply ?? post.reply);
+              post.favorites = detailFavorites;
+              detailsFetchedPids.add(post.pid);
+              if (detailFavorites === null) {
+                pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
+              }
+              detailsRequested += 1;
+              chunkDetails += 1;
             });
-            chunkStartPage = pageNumber + 1;
-            chunkScanned = 0;
-            chunkDetails = 0;
-            pendingRows = [];
-            pendingMatches = [];
-            pendingUnavailable = [];
-            chunkTelemetry = newTelemetry();
+
+            for (const row of rowsByPid.values()) {
+              if (
+                row.timestamp >= reportStartTimestamp &&
+                row.timestamp < endTimestamp &&
+                matchesThresholds(row)
+              ) {
+                pendingMatches.push({ ...row });
+              }
+            }
+
+            const missingText = pendingMatches.filter(
+              (post) =>
+                post.source_page === pageNumber &&
+                !post.text.trim() &&
+                !detailsFetchedPids.has(post.pid),
+            );
+            await mapLimit(missingText, effectiveConcurrency, async (post) => {
+              await pacingSleep();
+              const detailJson = await requestJson(
+                `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
+                `detail #${post.pid}`,
+              );
+              const hole = detailJson?.data?.hole || {};
+              post.text = hole.text || post.text;
+              post.type = hole.type || post.type;
+              post.reply = Number(hole.reply ?? post.reply);
+              let detailFavorites =
+                hole.likenum === null || hole.likenum === undefined || hole.likenum === ''
+                  ? post.favorites
+                  : Number(hole.likenum);
+              if (
+                detailFavorites !== null &&
+                (!Number.isInteger(detailFavorites) || detailFavorites < 0)
+              ) {
+                detailFavorites = post.favorites;
+              }
+              post.favorites = detailFavorites;
+              if (
+                minFavorites !== null &&
+                detailFavorites === null &&
+                !pendingUnavailable.some((item) => item.pid === post.pid)
+              ) {
+                pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
+              }
+              const cached = rowsByPid.get(post.pid);
+              if (cached) {
+                cached.text = post.text;
+                cached.type = post.type;
+                cached.reply = post.reply;
+                cached.favorites = post.favorites;
+              }
+              detailsRequested += 1;
+              chunkDetails += 1;
+            });
+            pendingMatches = pendingMatches.filter(
+              (post) => post.source_page !== pageNumber || matchesThresholds(post),
+            );
+
+            const oldest = Number(posts.at(-1)?.timestamp || 0);
+            if (oldest && oldest < scanStartTimestamp) reachedStart = true;
+            const terminal = reachedStart || feedExhausted || pages === maxPages;
+            if (terminal && batchIndex + 1 < pageResults.length) {
+              chunkTelemetry.overfetch_pages += pageResults.length - batchIndex - 1;
+            }
+            const checkpoint =
+              (pagesBefore + pages) % checkpointPages === 0 || terminal;
+            const chunkFull = pages % cacheChunkPages === 0;
+
+            if (chunkFull || terminal || checkpoint) {
+              const result = terminal
+                ? {
+                    collected_at: new Date().toISOString(),
+                    batch_start_page: startPage,
+                    batch_end_page: pageNumber,
+                    next_page: pageNumber + 1,
+                    pages,
+                    scanned,
+                    details_requested: detailsRequested,
+                    reached_start: reachedStart,
+                    feed_exhausted: feedExhausted,
+                  }
+                : null;
+              chunkTelemetry.wall_ms = Math.max(
+                0,
+                Math.round(performance.now() - chunkWallStartedAt),
+              );
+              await sendToSink({
+                schema_version: 1,
+                start_page: chunkStartPage,
+                end_page: pageNumber,
+                pages: pageNumber - chunkStartPage + 1,
+                scanned: chunkScanned,
+                details_requested: chunkDetails,
+                oldest,
+                reached_start: reachedStart,
+                feed_exhausted: feedExhausted,
+                checkpoint,
+                terminal,
+                result,
+                rows: pendingRows,
+                matches: pendingMatches,
+                favorite_unavailable: pendingUnavailable,
+                telemetry: chunkTelemetry,
+              });
+              chunkStartPage = pageNumber + 1;
+              chunkScanned = 0;
+              chunkDetails = 0;
+              pendingRows = [];
+              pendingMatches = [];
+              pendingUnavailable = [];
+              chunkTelemetry = newTelemetry();
+              chunkWallStartedAt = performance.now();
+            }
+            if (terminal) break;
           }
-          if (reachedStart || feedExhausted) break;
         }
 
         return {
@@ -415,6 +486,7 @@ async (page) => {
         pagesBefore,
         checkpointPages,
         cacheChunkPages,
+        requestConcurrency,
         delayMinMs,
         delayMaxMs,
         sinkUrl,

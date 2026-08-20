@@ -30,6 +30,6 @@ All responses were HTTP 200 with application code `20000`; silent acceptance the
 
 ## Implementation decision
 
-Keep page-number pagination with the validated `limit=500`. Stop when the oldest row crosses the requested start time. Use SQLite PID deduplication, resumable `next_page` checkpoints, and reusable time coverage to avoid repeated historical traversal.
+Keep page-number pagination with the validated `limit=500`. Stop when the oldest row crosses the requested start time. Use SQLite PID deduplication, resumable `next_page` checkpoints, and reusable time coverage to avoid repeated historical traversal. Bounded workers may fetch a small page window concurrently, but results must be buffered and committed in page order; pages beyond a detected time boundary are treated as overfetch and never advance the checkpoint.
 
-Re-probe only if the frontend request builder changes, the endpoint starts returning cursor metadata, or page pagination demonstrably stops working. Preserve the sequential 0.6–2 second request interval during any future probe.
+Re-probe only if the frontend request builder changes, the endpoint starts returning cursor metadata, or page pagination demonstrably stops working. Preserve the 0.6–2 second per-request jitter and the bounded concurrency cap during any future probe.
