@@ -27,6 +27,7 @@ HoleClaw 是一个树洞Claw，它按时间范围、评论数和收藏数阈值�
 | Node.js/npm | 通过 `npx` 启动 Playwright CLI |
 | Google Chrome / Edge | 浏览器自动化 |
 
+适用于 WSL2 环境
 ## 安装
 
 作为 Codex Skill 安装：
