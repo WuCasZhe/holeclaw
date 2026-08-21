@@ -213,6 +213,12 @@ async (page) => {
           await Promise.all(runners);
         };
 
+        const nonNegativeInteger = (rawValue, fallback = null) => {
+          if (rawValue === null || rawValue === undefined || rawValue === '') return fallback;
+          const value = Number(rawValue);
+          return Number.isInteger(value) && value >= 0 ? value : fallback;
+        };
+
         const sendToSink = async (payload) => {
           let lastError = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -234,16 +240,13 @@ async (page) => {
 
         let pages = 0;
         let scanned = 0;
-        let detailsRequested = 0;
         let reachedStart = false;
         let feedExhausted = false;
-        let lastPage = startPage - 1;
         let chunkStartPage = startPage;
         let chunkScanned = 0;
-        let chunkDetails = 0;
         let pendingRows = [];
-        let pendingMatches = [];
-        let pendingUnavailable = [];
+        let pendingMatchedPids = new Set();
+        let pendingUnavailableByPid = new Map();
         const matchesThresholds = (post) => {
           const conditions = [];
           if (minComments !== null) conditions.push(post.reply > minComments);
@@ -274,7 +277,6 @@ async (page) => {
           for (let batchIndex = 0; batchIndex < pageResults.length; batchIndex += 1) {
             const { pageNumber, posts } = pageResults[batchIndex];
             pages += 1;
-            lastPage = pageNumber;
             scanned += posts.length;
             chunkScanned += posts.length;
 
@@ -286,119 +288,62 @@ async (page) => {
             const rowsByPid = new Map();
             const detailsFetchedPids = new Set();
             for (const post of posts) {
-              const rawFavorites = post.likenum;
-              let favorites =
-                rawFavorites === null || rawFavorites === undefined || rawFavorites === ''
-                  ? null
-                  : Number(rawFavorites);
-              if (favorites !== null && (!Number.isInteger(favorites) || favorites < 0)) {
-                favorites = null;
-              }
               const row = {
                 pid: String(post.pid),
                 timestamp: Number(post.timestamp),
                 reply: Number(post.reply),
-                favorites,
+                favorites: nonNegativeInteger(post.likenum),
                 type: post.type || 'text',
                 text: post.text || '',
-                source_page: pageNumber,
               };
               rowsByPid.set(row.pid, row);
               pendingRows.push(row);
             }
 
+            const fetchAndApplyDetail = async (post, favoritesFallback) => {
+              await pacingSleep();
+              const detailJson = await requestJson(
+                `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
+                `detail #${post.pid}`,
+              );
+              const hole = detailJson?.data?.hole || {};
+              post.text = hole.text || post.text;
+              post.type = hole.type || post.type;
+              post.reply = Number(hole.reply ?? post.reply);
+              post.favorites = nonNegativeInteger(hole.likenum, favoritesFallback);
+              detailsFetchedPids.add(post.pid);
+              if (minFavorites !== null && post.favorites === null) {
+                pendingUnavailableByPid.set(post.pid, {
+                  pid: post.pid,
+                  reason: 'detail_missing',
+                });
+              }
+            };
+
             const missingFavorites = [...rowsByPid.values()].filter(
               (post) => minFavorites !== null && post.favorites === null,
             );
             await mapLimit(missingFavorites, effectiveConcurrency, async (post) => {
-              await pacingSleep();
-              const detailJson = await requestJson(
-                `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
-                `detail #${post.pid}`,
-              );
-              const hole = detailJson?.data?.hole || {};
-              const rawDetailFavorites = hole.likenum;
-              let detailFavorites =
-                rawDetailFavorites === null ||
-                rawDetailFavorites === undefined ||
-                rawDetailFavorites === ''
-                  ? null
-                  : Number(rawDetailFavorites);
-              if (
-                detailFavorites !== null &&
-                (!Number.isInteger(detailFavorites) || detailFavorites < 0)
-              ) {
-                detailFavorites = null;
-              }
-              post.text = hole.text || post.text;
-              post.type = hole.type || post.type;
-              post.reply = Number(hole.reply ?? post.reply);
-              post.favorites = detailFavorites;
-              detailsFetchedPids.add(post.pid);
-              if (detailFavorites === null) {
-                pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
-              }
-              detailsRequested += 1;
-              chunkDetails += 1;
+              await fetchAndApplyDetail(post, null);
             });
 
-            for (const row of rowsByPid.values()) {
-              if (
+            let pageMatches = [...rowsByPid.values()].filter(
+              (row) =>
                 row.timestamp >= reportStartTimestamp &&
                 row.timestamp < endTimestamp &&
-                matchesThresholds(row)
-              ) {
-                pendingMatches.push({ ...row });
-              }
-            }
+                matchesThresholds(row),
+            );
 
-            const missingText = pendingMatches.filter(
+            const missingText = pageMatches.filter(
               (post) =>
-                post.source_page === pageNumber &&
                 !post.text.trim() &&
                 !detailsFetchedPids.has(post.pid),
             );
             await mapLimit(missingText, effectiveConcurrency, async (post) => {
-              await pacingSleep();
-              const detailJson = await requestJson(
-                `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
-                `detail #${post.pid}`,
-              );
-              const hole = detailJson?.data?.hole || {};
-              post.text = hole.text || post.text;
-              post.type = hole.type || post.type;
-              post.reply = Number(hole.reply ?? post.reply);
-              let detailFavorites =
-                hole.likenum === null || hole.likenum === undefined || hole.likenum === ''
-                  ? post.favorites
-                  : Number(hole.likenum);
-              if (
-                detailFavorites !== null &&
-                (!Number.isInteger(detailFavorites) || detailFavorites < 0)
-              ) {
-                detailFavorites = post.favorites;
-              }
-              post.favorites = detailFavorites;
-              if (
-                minFavorites !== null &&
-                detailFavorites === null &&
-                !pendingUnavailable.some((item) => item.pid === post.pid)
-              ) {
-                pendingUnavailable.push({ pid: post.pid, reason: 'detail_missing' });
-              }
-              const cached = rowsByPid.get(post.pid);
-              if (cached) {
-                cached.text = post.text;
-                cached.type = post.type;
-                cached.reply = post.reply;
-                cached.favorites = post.favorites;
-              }
-              detailsRequested += 1;
-              chunkDetails += 1;
+              await fetchAndApplyDetail(post, post.favorites);
             });
-            pendingMatches = pendingMatches.filter(
-              (post) => post.source_page !== pageNumber || matchesThresholds(post),
-            );
+            pageMatches = pageMatches.filter(matchesThresholds);
+            for (const post of pageMatches) pendingMatchedPids.add(post.pid);
 
             const oldest = Number(posts.at(-1)?.timestamp || 0);
             if (oldest && oldest < scanStartTimestamp) reachedStart = true;
@@ -413,13 +358,10 @@ async (page) => {
             if (chunkFull || terminal || checkpoint) {
               const result = terminal
                 ? {
-                    collected_at: new Date().toISOString(),
-                    batch_start_page: startPage,
                     batch_end_page: pageNumber,
                     next_page: pageNumber + 1,
                     pages,
                     scanned,
-                    details_requested: detailsRequested,
                     reached_start: reachedStart,
                     feed_exhausted: feedExhausted,
                   }
@@ -429,12 +371,11 @@ async (page) => {
                 Math.round(performance.now() - chunkWallStartedAt),
               );
               await sendToSink({
-                schema_version: 1,
+                schema_version: 2,
                 start_page: chunkStartPage,
                 end_page: pageNumber,
                 pages: pageNumber - chunkStartPage + 1,
                 scanned: chunkScanned,
-                details_requested: chunkDetails,
                 oldest,
                 reached_start: reachedStart,
                 feed_exhausted: feedExhausted,
@@ -442,16 +383,15 @@ async (page) => {
                 terminal,
                 result,
                 rows: pendingRows,
-                matches: pendingMatches,
-                favorite_unavailable: pendingUnavailable,
+                matched_pids: [...pendingMatchedPids],
+                favorite_unavailable: [...pendingUnavailableByPid.values()],
                 telemetry: chunkTelemetry,
               });
               chunkStartPage = pageNumber + 1;
               chunkScanned = 0;
-              chunkDetails = 0;
               pendingRows = [];
-              pendingMatches = [];
-              pendingUnavailable = [];
+              pendingMatchedPids = new Set();
+              pendingUnavailableByPid = new Map();
               chunkTelemetry = newTelemetry();
               chunkWallStartedAt = performance.now();
             }
@@ -459,17 +399,7 @@ async (page) => {
           }
         }
 
-        return {
-          collected_at: new Date().toISOString(),
-          batch_start_page: startPage,
-          batch_end_page: lastPage,
-          next_page: lastPage + 1,
-          pages,
-          scanned,
-          details_requested: detailsRequested,
-          reached_start: reachedStart,
-          feed_exhausted: feedExhausted,
-        };
+        return null;
       },
       {
         endpoint,

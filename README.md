@@ -75,7 +75,7 @@ python3 scripts/run_digest.py standalone \
 
 首次运行时，脚本会打开可视浏览器。用户亲自完成统一身份认证，进入树洞首页后回到终端按 Enter。脚本会保存本地登录状态并自动继续
 
-登录状态、SQLite 缓存和检查点默认相对于当前工作目录保存，因此请始终从同一目录运行，或用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 指定固定路径。全局参数需放在 `standalone` 之前，例如：
+登录状态、SQLite 缓存和检查点默认相对于当前工作目录保存，因此请始终从同一目录运行，或用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 指定固定路径。当前默认缓存为 `output/playwright/holeclaw-cache-v5.sqlite3`，检查点位于 `output/playwright/holeclaw-checkpoints-v4/`。全局参数需放在 `standalone` 之前，例如：
 
 ```bash
 python3 scripts/run_digest.py \
@@ -83,3 +83,5 @@ python3 scripts/run_digest.py \
   standalone --days 1 --min-comments 100 \
   --cache /var/lib/holeclaw/cache.sqlite3
 ```
+
+缓存 schema v5 和检查点 schema v4 不迁移旧版本。旧的默认缓存与检查点会原样保留；如果显式传入旧 schema 文件，程序会要求改用新路径。

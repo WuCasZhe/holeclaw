@@ -107,8 +107,19 @@ const page = {
     );
     assert.equal(sinkPayloads.at(-1).terminal, true);
     assert.equal(sinkPayloads.at(-1).reached_start, true);
-    assert.equal(result.pages, 2);
-    assert.equal(result.next_page, 3);
+    assert.equal(result, null, 'the collector result is delivered only through the sink');
+    assert.ok(sinkPayloads.every((payload) => payload.schema_version === 2));
+    assert.deepEqual(sinkPayloads[0].matched_pids, ['newer']);
+    assert.ok(
+      sinkPayloads.every((payload) =>
+        payload.rows.every((row) => !Object.hasOwn(row, 'source_page'))),
+      'source_page must remain page-local collector state',
+    );
+    assert.deepEqual(
+      Object.keys(sinkPayloads.at(-1).result).sort(),
+      ['batch_end_page', 'feed_exhausted', 'next_page', 'pages', 'reached_start', 'scanned'],
+      'terminal result must contain only fields consumed by the sink',
+    );
     assert.equal(
       sinkPayloads.reduce(
         (total, payload) => total + payload.telemetry.overfetch_pages,

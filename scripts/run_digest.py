@@ -25,7 +25,9 @@ SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 4
+SINK_SCHEMA_VERSION = 2
 TELEMETRY_FIELDS = (
     "list_requests",
     "detail_requests",
@@ -102,31 +104,32 @@ class BrowserCli:
             self.run(*arguments)
 
 
-def ensure_auth_ignored(state: Path) -> None:
-    default_auth = Path.cwd() / ".auth"
-    try:
-        state.resolve().relative_to(default_auth.resolve())
-    except ValueError:
-        return
+def ensure_gitignore_entry(entry: str) -> None:
     ignore = Path.cwd() / ".gitignore"
     current = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
-    lines = current.splitlines()
-    if ".auth/" not in lines:
+    if entry not in current.splitlines():
         suffix = "" if not current or current.endswith("\n") else "\n"
-        ignore.write_text(current + suffix + ".auth/\n", encoding="utf-8")
+        ignore.write_text(current + suffix + entry + "\n", encoding="utf-8")
+
+
+def ensure_path_ignored(path: Path, root: Path, entry: str) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    ensure_gitignore_entry(entry)
+    return True
+
+
+def ensure_auth_ignored(state: Path) -> None:
+    ensure_path_ignored(state, Path.cwd() / ".auth", ".auth/")
 
 
 def ensure_runtime_ignored(*paths: Path) -> None:
     runtime_root = (Path.cwd() / "output/playwright").resolve()
-    if not any(
-        path.resolve() == runtime_root or runtime_root in path.resolve().parents for path in paths
-    ):
-        return
-    ignore = Path.cwd() / ".gitignore"
-    current = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
-    if "output/playwright/" not in current.splitlines():
-        suffix = "" if not current or current.endswith("\n") else "\n"
-        ignore.write_text(current + suffix + "output/playwright/\n", encoding="utf-8")
+    for path in paths:
+        if ensure_path_ignored(path, runtime_root, "output/playwright/"):
+            return
 
 
 def authenticated(snapshot: str) -> bool:
@@ -226,11 +229,11 @@ def default_checkpoint_path(spec: dict) -> Path:
     fingerprint = hashlib.sha256(
         json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
-    return Path.cwd() / "output/playwright/holeclaw-checkpoints" / f"{fingerprint}.json"
+    return Path.cwd() / "output/playwright/holeclaw-checkpoints-v4" / f"{fingerprint}.json"
 
 
 def default_cache_path() -> Path:
-    return Path.cwd() / "output/playwright/holeclaw-cache.sqlite3"
+    return Path.cwd() / "output/playwright/holeclaw-cache-v5.sqlite3"
 
 
 def write_checkpoint(path: Path, checkpoint: dict) -> None:
@@ -250,29 +253,24 @@ def new_checkpoint(
     end_ts: int,
     scan_start_ts: int,
     window_label: str,
-    checkpoint_pages: int,
-    cache_base: dict | None,
+    cache_reused: bool = False,
+    favorites_complete: bool = True,
 ) -> dict:
     now = datetime.now(SHANGHAI).isoformat()
     return {
-        "schema_version": 3,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "request": spec,
         "start_timestamp": start_ts,
         "end_timestamp": end_ts,
         "scan_start_timestamp": scan_start_ts,
         "window_label": window_label,
-        "checkpoint_pages": checkpoint_pages,
-        "cache_base": cache_base,
+        "cache_reused": cache_reused,
         "next_page": 1,
         "total_pages": 0,
         "total_scanned": 0,
-        "details_requested": 0,
         "matched_by_pid": {},
-        "favorite_unavailable_by_pid": {},
         "telemetry": empty_telemetry(),
-        "favorites_complete": (
-            bool(cache_base.get("favorites_complete", False)) if cache_base else True
-        ),
+        "favorites_complete": favorites_complete,
         "reached_start": False,
         "feed_exhausted": False,
         "completed": False,
@@ -281,24 +279,23 @@ def new_checkpoint(
     }
 
 
-def load_checkpoint(path: Path, spec: dict) -> dict:
+def read_checkpoint(path: Path) -> dict:
     try:
-        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise CliError(f"Cannot read checkpoint {path}: {error}") from error
-    if checkpoint.get("schema_version") not in (1, 2, 3) or checkpoint.get("request") != spec:
+
+
+def load_checkpoint(path: Path, spec: dict) -> dict:
+    checkpoint = read_checkpoint(path)
+    if (
+        checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
+        or checkpoint.get("request") != spec
+    ):
         raise CliError(
-            f"Checkpoint parameters do not match: {path}. Use --fresh to start over."
+            f"Checkpoint is incompatible or parameters do not match: {path}. "
+            "Use a new checkpoint path."
         )
-    checkpoint.setdefault("scan_start_timestamp", checkpoint["start_timestamp"])
-    checkpoint.setdefault("cache_base", None)
-    checkpoint.setdefault("favorites_complete", False)
-    checkpoint.setdefault("favorite_unavailable_by_pid", {})
-    checkpoint.setdefault("telemetry", empty_telemetry())
-    if checkpoint["schema_version"] >= 2:
-        checkpoint["matched_by_pid"] = {
-            str(pid): True for pid in checkpoint.get("matched_by_pid", {})
-        }
     return checkpoint
 
 
@@ -306,6 +303,28 @@ class CacheStore:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                inspection = sqlite3.connect(
+                    f"file:{self.path}?mode=ro", uri=True, timeout=5
+                )
+                try:
+                    schema_row = inspection.execute(
+                        "SELECT value FROM metadata WHERE key='schema_version'"
+                    ).fetchone()
+                finally:
+                    inspection.close()
+                schema_version = int(schema_row[0]) if schema_row else 0
+            except (sqlite3.Error, TypeError, ValueError) as error:
+                raise CliError(
+                    f"Cache is incompatible with schema v{CACHE_SCHEMA_VERSION}: {self.path}. "
+                    "Use a new cache path."
+                ) from error
+            if schema_version != CACHE_SCHEMA_VERSION:
+                raise CliError(
+                    f"Cache schema v{schema_version} is incompatible with schema "
+                    f"v{CACHE_SCHEMA_VERSION}: {self.path}. Use a new cache path."
+                )
         self.lock = threading.RLock()
         self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         self.connection.row_factory = sqlite3.Row
@@ -321,13 +340,6 @@ class CacheStore:
                 )
                 """
             )
-            schema_row = self.connection.execute(
-                "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()
-            try:
-                previous_schema_version = int(schema_row[0]) if schema_row else 0
-            except (TypeError, ValueError):
-                previous_schema_version = 0
             self.connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS posts (
@@ -337,15 +349,10 @@ class CacheStore:
                     favorites INTEGER,
                     type TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    observed_at INTEGER NOT NULL,
-                    source_page INTEGER NOT NULL
+                    observed_at INTEGER NOT NULL
                 )
                 """
             )
-            if previous_schema_version < 4:
-                self.connection.execute("DROP INDEX IF EXISTS posts_timestamp_idx")
-                self.connection.execute("DROP INDEX IF EXISTS posts_reply_idx")
-                self.connection.execute("DROP INDEX IF EXISTS posts_favorites_idx")
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS posts_window_idx "
                 "ON posts(timestamp DESC, pid DESC)"
@@ -372,19 +379,6 @@ class CacheStore:
                 )
                 """
             )
-            post_columns = {
-                str(row[1]) for row in self.connection.execute("PRAGMA table_info(posts)")
-            }
-            if "favorites" not in post_columns:
-                self.connection.execute("ALTER TABLE posts ADD COLUMN favorites INTEGER")
-            coverage_columns = {
-                str(row[1]) for row in self.connection.execute("PRAGMA table_info(coverage)")
-            }
-            if "favorites_complete" not in coverage_columns:
-                self.connection.execute(
-                    "ALTER TABLE coverage ADD COLUMN favorites_complete "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
             self.connection.execute(
                 "CREATE INDEX IF NOT EXISTS coverage_window_idx "
                 "ON coverage(start_timestamp, end_timestamp)"
@@ -436,13 +430,11 @@ class CacheStore:
             reply = int(row.get("reply", 0))
             raw_favorites = row.get("favorites")
             favorites = None if raw_favorites is None else int(raw_favorites)
-            source_page = int(row.get("source_page", 0))
             if (
                 not pid
                 or timestamp <= 0
                 or reply < 0
                 or (favorites is not None and favorites < 0)
-                or source_page <= 0
             ):
                 raise CliError("Collector returned an invalid cache row.")
             values.append(
@@ -454,16 +446,15 @@ class CacheStore:
                     str(row.get("type") or "text"),
                     str(row.get("text") or ""),
                     observed_at,
-                    source_page,
                 )
             )
         with self.lock:
             self.connection.executemany(
                 """
                 INSERT INTO posts(
-                    pid, timestamp, reply, favorites, type, text, observed_at, source_page
+                    pid, timestamp, reply, favorites, type, text, observed_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pid) DO UPDATE SET
                     timestamp=excluded.timestamp,
                     reply=excluded.reply,
@@ -473,16 +464,22 @@ class CacheStore:
                     END,
                     type=excluded.type,
                     text=CASE WHEN excluded.text <> '' THEN excluded.text ELSE posts.text END,
-                    observed_at=excluded.observed_at,
-                    source_page=excluded.source_page
+                    observed_at=excluded.observed_at
                 """,
                 values,
             )
-            known_pids = [value[0] for value in values if value[3] is not None]
-            if known_pids:
+            input_pids = [value[0] for value in values]
+            if input_pids:
                 self.connection.executemany(
-                    "DELETE FROM favorite_unavailable WHERE pid = ?",
-                    ((pid,) for pid in known_pids),
+                    """
+                    DELETE FROM favorite_unavailable
+                    WHERE pid = ?
+                      AND EXISTS (
+                          SELECT 1 FROM posts
+                          WHERE posts.pid = ? AND posts.favorites IS NOT NULL
+                      )
+                    """,
+                    ((pid, pid) for pid in input_pids),
                 )
             if commit:
                 self.connection.commit()
@@ -510,34 +507,6 @@ class CacheStore:
                     reason=excluded.reason
                 """,
                 values,
-            )
-            self.connection.execute(
-                """
-                DELETE FROM favorite_unavailable
-                WHERE pid IN (SELECT pid FROM posts WHERE favorites IS NOT NULL)
-                """
-            )
-            self.connection.execute(
-                """
-                UPDATE coverage
-                SET favorites_complete = 1
-                WHERE favorites_complete = 0
-                  AND EXISTS (
-                      SELECT 1 FROM posts AS covered
-                      WHERE covered.timestamp >= coverage.start_timestamp
-                        AND covered.timestamp < coverage.end_timestamp
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM posts AS missing
-                      WHERE missing.timestamp >= coverage.start_timestamp
-                        AND missing.timestamp < coverage.end_timestamp
-                        AND missing.favorites IS NULL
-                        AND NOT EXISTS (
-                            SELECT 1 FROM favorite_unavailable AS unavailable
-                            WHERE unavailable.pid = missing.pid
-                        )
-                  )
-                """
             )
             if commit:
                 self.connection.commit()
@@ -676,7 +645,7 @@ class RunSink:
         self.terminal_result: dict | None = None
 
     def ingest(self, payload: dict) -> None:
-        if payload.get("schema_version") != 1:
+        if payload.get("schema_version") != SINK_SCHEMA_VERSION:
             raise CliError("Collector sink schema mismatch.")
         with self.lock:
             start_page = int(payload.get("start_page", 0))
@@ -692,13 +661,19 @@ class RunSink:
                 raise CliError("Collector returned a non-sequential cache chunk.")
 
             rows = payload.get("rows") or []
-            matches = payload.get("matches") or []
+            matched_pids = payload.get("matched_pids") or []
             unavailable = payload.get("favorite_unavailable") or []
+            if not isinstance(matched_pids, list) or not all(
+                isinstance(pid, str) and pid for pid in matched_pids
+            ):
+                raise CliError("Collector returned invalid matched PIDs.")
             if len(rows) != scanned:
                 raise CliError("Collector cache row count does not match scanned count.")
             row_pids = {str(row.get("pid", "")) for row in rows}
-            match_pids = {str(row.get("pid", "")) for row in matches}
+            match_pids = {str(pid) for pid in matched_pids}
             unavailable_pids = {str(row.get("pid", "")) for row in unavailable}
+            if len(match_pids) != len(matched_pids):
+                raise CliError("Collector returned duplicate matched PIDs.")
             if "" in unavailable_pids or not unavailable_pids.issubset(row_pids):
                 raise CliError("Collector returned invalid unavailable favorite metadata.")
             if "" in match_pids or not match_pids.issubset(row_pids):
@@ -706,6 +681,8 @@ class RunSink:
             missing_favorite_pids = {
                 str(row.get("pid", "")) for row in rows if row.get("favorites") is None
             }
+            if not unavailable_pids.issubset(missing_favorite_pids):
+                raise CliError("Collector marked a known favorite count as unavailable.")
             if self.min_favorites is not None and not missing_favorite_pids.issubset(
                 unavailable_pids
             ):
@@ -714,12 +691,14 @@ class RunSink:
             report_start = self.checkpoint["start_timestamp"]
             report_end = self.checkpoint["end_timestamp"]
             validated_match_pids = []
-            for post in matches:
+            rows_by_pid = {str(row.get("pid", "")): row for row in rows}
+            for pid in matched_pids:
+                post = rows_by_pid[str(pid)]
                 timestamp = int(post.get("timestamp", 0))
                 reply = int(post.get("reply", 0))
                 raw_favorites = post.get("favorites")
                 favorites = None if raw_favorites is None else int(raw_favorites)
-                pid = str(post.get("pid", ""))
+                normalized_pid = str(pid)
                 conditions = []
                 if self.min_comments is not None:
                     conditions.append(reply > self.min_comments)
@@ -731,30 +710,22 @@ class RunSink:
                     any(conditions) if self.match_mode == "any" else all(conditions)
                 )
                 if (
-                    not pid
+                    not normalized_pid
                     or not (report_start <= timestamp < report_end)
                     or not engagement_match
                 ):
                     raise CliError("Collector returned a post outside the requested filter.")
-                validated_match_pids.append(pid)
+                validated_match_pids.append(normalized_pid)
 
-            details_requested = int(payload.get("details_requested", 0))
-            if details_requested < 0:
-                raise CliError("Collector returned an invalid detail-request count.")
             chunk_telemetry = empty_telemetry()
             merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
             cache_started = time.perf_counter()
             with self.cache.transaction():
-                self.cache.upsert_posts(rows, commit=False)
                 self.cache.record_favorite_unavailable(unavailable, commit=False)
+                self.cache.upsert_posts(rows, commit=False)
             cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
             chunk_telemetry["cache_write_ms"] = cache_write_ms
             merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            for item in unavailable:
-                self.checkpoint["favorite_unavailable_by_pid"][str(item["pid"])] = {
-                    "pid": str(item["pid"]),
-                    "reason": str(item.get("reason") or "detail_missing"),
-                }
             if missing_favorite_pids and self.min_favorites is None:
                 self.checkpoint["favorites_complete"] = False
             for pid in validated_match_pids:
@@ -763,7 +734,6 @@ class RunSink:
             self.checkpoint["next_page"] = end_page + 1
             self.checkpoint["total_pages"] += pages
             self.checkpoint["total_scanned"] += scanned
-            self.checkpoint["details_requested"] += details_requested
             self.checkpoint["reached_start"] = bool(payload.get("reached_start"))
             self.checkpoint["feed_exhausted"] = bool(payload.get("feed_exhausted"))
             self.checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
@@ -906,27 +876,27 @@ def one_line_summary(text: str, post_type: str) -> str:
     return value
 
 
-def checkpoint_report_data(checkpoint: dict) -> dict:
-    candidates = sorted(
-        checkpoint["matched_by_pid"].values(), key=lambda post: post["timestamp"], reverse=True
-    )
-    return {
-        "collected_at": checkpoint.get("completed_at") or checkpoint["updated_at"],
-        "start_timestamp": checkpoint["start_timestamp"],
-        "end_timestamp": checkpoint["end_timestamp"],
-        "min_comments": checkpoint["request"]["min_comments"],
-        "min_favorites": checkpoint["request"].get("min_favorites"),
-        "match_mode": checkpoint["request"].get("match_mode", "all"),
-        "pages": checkpoint["total_pages"],
-        "scanned": checkpoint["total_scanned"],
-        "details_requested": checkpoint["details_requested"],
-        "candidate_count": len(candidates),
-        "candidates": candidates,
-        "cache_reused": False,
-        "favorite_unavailable": list(
-            checkpoint.get("favorite_unavailable_by_pid", {}).values()
-        ),
-    }
+def report_profile(
+    min_comments: int | None, min_favorites: int | None, match_mode: str
+) -> tuple[str, str]:
+    if min_comments is not None and min_favorites is not None and match_mode == "any":
+        return "high-comments-or-favorites", "北大树洞高评论或高收藏帖报告"
+    if min_comments is not None and min_favorites is not None:
+        return "high-comments-and-favorites", "北大树洞高评论与高收藏帖报告"
+    if min_favorites is not None:
+        return "high-favorites", "北大树洞高收藏帖报告"
+    return "high-comments", "北大树洞高评论帖报告"
+
+
+def filter_description(
+    min_comments: int | None, min_favorites: int | None, match_mode: str
+) -> str:
+    conditions = []
+    if min_comments is not None:
+        conditions.append(f"评论数 > {min_comments}")
+    if min_favorites is not None:
+        conditions.append(f"收藏数 > {min_favorites}")
+    return (" 或 " if match_mode == "any" else " 且 ").join(conditions)
 
 
 def cache_report_data(
@@ -939,7 +909,6 @@ def cache_report_data(
     collected_at: str,
     pages: int,
     scanned: int,
-    details_requested: int,
     cache_reused: bool,
 ) -> dict:
     candidates = cache.query_posts(
@@ -954,7 +923,6 @@ def cache_report_data(
         "match_mode": match_mode,
         "pages": pages,
         "scanned": scanned,
-        "details_requested": details_requested,
         "candidate_count": len(candidates),
         "candidates": candidates,
         "cache_reused": cache_reused,
@@ -974,28 +942,16 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
     min_comments = data["min_comments"]
     min_favorites = data["min_favorites"]
     match_mode = data.get("match_mode", "all")
-    if min_comments is not None and min_favorites is not None and match_mode == "any":
-        title = "北大树洞高评论或高收藏帖报告"
-    elif min_comments is not None and min_favorites is not None:
-        title = "北大树洞高评论与高收藏帖报告"
-    elif min_favorites is not None:
-        title = "北大树洞高收藏帖报告"
-    else:
-        title = "北大树洞高评论帖报告"
+    _slug, title = report_profile(min_comments, min_favorites, match_mode)
     lines = [
         f"# {title}（{window_label}）",
         "",
         f"- 生成时间：{collected:%Y-%m-%d %H:%M:%S}（Asia/Shanghai）",
         f"- 时间范围：{start:%Y-%m-%d %H:%M:%S} 至 {end:%Y-%m-%d %H:%M:%S}",
     ]
-    conditions = []
-    if min_comments is not None:
-        conditions.append(f"评论数 > {min_comments}")
-    if min_favorites is not None:
-        conditions.append(f"收藏数 > {min_favorites}")
     lines.extend(
         [
-            f"- 筛选条件：{(' 或 ' if match_mode == 'any' else ' 且 ').join(conditions)}",
+            f"- 筛选条件：{filter_description(min_comments, min_favorites, match_mode)}",
             f"- 本次网络扫描：{data['pages']} 页，{data['scanned']:,} 条帖子",
             f"- 命中：{data['candidate_count']} 条",
         ]
@@ -1040,6 +996,45 @@ def render_report(data: dict, output: Path, window_label: str) -> None:
     output.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def emit_cached_report(
+    cache: CacheStore,
+    output: Path,
+    window_label: str,
+    start_ts: int,
+    end_ts: int,
+    min_comments: int | None,
+    min_favorites: int | None,
+    match_mode: str,
+    collected_at: str,
+    pages: int,
+    scanned: int,
+    cache_reused: bool,
+    marker: str,
+) -> None:
+    data = cache_report_data(
+        cache,
+        start_ts,
+        end_ts,
+        min_comments,
+        min_favorites,
+        match_mode,
+        collected_at,
+        pages,
+        scanned,
+        cache_reused,
+    )
+    render_report(data, output, window_label)
+    summary = {
+        "report": str(output),
+        "cache": str(cache.path),
+        "pages": data["pages"],
+        "scanned": data["scanned"],
+        "matched": data["candidate_count"],
+        marker: True,
+    }
+    print(json.dumps(summary, ensure_ascii=False))
+
+
 def login_open(args: argparse.Namespace) -> None:
     browser = BrowserCli(args.session)
     browser.ensure_session()
@@ -1065,6 +1060,13 @@ def save_login_state(browser: BrowserCli, state: Path) -> None:
     print(f"登录状态已保存：{state}")
 
 
+def load_authenticated_state(browser: BrowserCli, state: Path) -> bool:
+    browser.run("goto", "about:blank")
+    browser.run("state-load", native_path(state))
+    browser.run("goto", SITE_URL)
+    return authenticated(browser.run("snapshot").stdout)
+
+
 def ensure_standalone_login(args: argparse.Namespace) -> BrowserCli:
     state = args.state.resolve()
     if not state.is_file() and args.non_interactive:
@@ -1077,10 +1079,7 @@ def ensure_standalone_login(args: argparse.Namespace) -> BrowserCli:
     browser.ensure_session()
     if state.is_file():
         try:
-            browser.run("goto", "about:blank")
-            browser.run("state-load", native_path(state))
-            browser.run("goto", SITE_URL)
-            if authenticated(browser.run("snapshot").stdout):
+            if load_authenticated_state(browser, state):
                 print("已加载有效登录状态，继续自动采集。", flush=True)
                 return browser
             reason = "已保存的登录状态已失效"
@@ -1230,15 +1229,17 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
     checkpoint_path = (args.checkpoint or default_checkpoint_path(spec)).resolve()
     cache_path = (args.cache or default_cache_path()).resolve()
     ensure_runtime_ignored(checkpoint_path, cache_path)
+    if checkpoint_path.exists() and args.fresh:
+        existing_checkpoint = read_checkpoint(checkpoint_path)
+        if existing_checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            raise CliError(
+                f"Checkpoint is incompatible with schema v{CHECKPOINT_SCHEMA_VERSION}: "
+                f"{checkpoint_path}. Use a new checkpoint path."
+            )
     cache_existed = cache_path.exists()
-    if args.match_mode == "any":
-        report_slug = "high-comments-or-favorites"
-    elif args.min_favorites is not None and args.min_comments is None:
-        report_slug = "high-favorites"
-    elif args.min_favorites is not None:
-        report_slug = "high-comments-and-favorites"
-    else:
-        report_slug = "high-comments"
+    report_slug, _title = report_profile(
+        args.min_comments, args.min_favorites, args.match_mode
+    )
     output = (
         args.output
         or Path.cwd() / "reports" / f"pku-treehole-{report_slug}-{date.today().isoformat()}.md"
@@ -1260,89 +1261,44 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                 start_ts = checkpoint["start_timestamp"]
                 end_ts = checkpoint["end_timestamp"]
                 window_label = checkpoint["window_label"]
-                checkpoint["checkpoint_pages"] = args.checkpoint_pages
-                if checkpoint["schema_version"] == 1 and not checkpoint["completed"]:
-                    print(
-                        "检测到旧版未完成检查点；为建立完整 SQLite 缓存，"
-                        "将保留冻结时间窗口并从 API 第 1 页重建。",
-                        flush=True,
+                recorded_cache = checkpoint.get("cache_path")
+                if recorded_cache and Path(recorded_cache).resolve() != cache_path:
+                    raise CliError(
+                        "Checkpoint belongs to a different SQLite cache. "
+                        "Use its original --cache path or start with --fresh."
                     )
-                    checkpoint = new_checkpoint(
-                        spec,
-                        start_ts,
-                        end_ts,
-                        start_ts,
-                        window_label,
-                        args.checkpoint_pages,
-                        None,
+                if checkpoint["total_pages"] > 0 and not cache_existed:
+                    raise CliError(
+                        "The SQLite cache required by this checkpoint is missing. "
+                        "Restore it or use --fresh."
                     )
-                    checkpoint["cache_path"] = str(cache_path)
-                    checkpoint["cache_instance_id"] = cache.instance_id
-                    write_checkpoint(checkpoint_path, checkpoint)
-                elif checkpoint["schema_version"] >= 2:
-                    recorded_cache = checkpoint.get("cache_path")
-                    if recorded_cache and Path(recorded_cache).resolve() != cache_path:
-                        raise CliError(
-                            "Checkpoint belongs to a different SQLite cache. "
-                            "Use its original --cache path or start with --fresh."
-                        )
-                    if checkpoint["total_pages"] > 0 and not cache_existed:
-                        raise CliError(
-                            "The SQLite cache required by this checkpoint is missing. "
-                            "Restore it or use --fresh."
-                        )
-                    recorded_instance = checkpoint.get("cache_instance_id")
-                    if recorded_instance and recorded_instance != cache.instance_id:
-                        raise CliError(
-                            "Checkpoint SQLite cache identity does not match. "
-                            "Restore the original cache or use --fresh."
-                        )
-                    if (
-                        not recorded_instance
-                        and checkpoint["total_scanned"] > 0
-                        and cache.post_count() == 0
-                    ):
-                        raise CliError(
-                            "Checkpoint has progress but the SQLite cache is empty. "
-                            "Restore it or use --fresh."
-                        )
-                    checkpoint["cache_path"] = str(cache_path)
-                    checkpoint["cache_instance_id"] = cache.instance_id
+                recorded_instance = checkpoint.get("cache_instance_id")
+                if recorded_instance != cache.instance_id:
+                    raise CliError(
+                        "Checkpoint SQLite cache identity does not match. "
+                        "Restore the original cache or use --fresh."
+                    )
+                checkpoint["cache_path"] = str(cache_path)
                 if checkpoint["completed"]:
                     coverage = cache.find_covering(
                         start_ts, end_ts, require_favorites=args.min_favorites is not None
                     )
-                    if coverage or checkpoint["schema_version"] >= 2:
-                        data = cache_report_data(
-                            cache,
-                            start_ts,
-                            end_ts,
-                            args.min_comments,
-                            args.min_favorites,
-                            args.match_mode,
-                            coverage["completed_at"]
-                            if coverage
-                            else checkpoint.get("completed_at", checkpoint["updated_at"]),
-                            0 if coverage else checkpoint["total_pages"],
-                            0 if coverage else checkpoint["total_scanned"],
-                            0,
-                            bool(coverage),
-                        )
-                    else:
-                        data = checkpoint_report_data(checkpoint)
-                    render_report(data, output, window_label)
-                    print(
-                        json.dumps(
-                            {
-                                "report": str(output),
-                                "cache": str(cache_path),
-                                "pages": data["pages"],
-                                "scanned": data["scanned"],
-                                "matched": data["candidate_count"],
-                                "reused_completed_checkpoint": True,
-                            },
-                            ensure_ascii=False,
-                        )
+                    emit_cached_report(
+                        cache,
+                        output,
+                        window_label,
+                        start_ts,
+                        end_ts,
+                        args.min_comments,
+                        args.min_favorites,
+                        args.match_mode,
+                        coverage["completed_at"]
+                        if coverage
+                        else checkpoint.get("completed_at", checkpoint["updated_at"]),
+                        0 if coverage else checkpoint["total_pages"],
+                        0 if coverage else checkpoint["total_scanned"],
+                        bool(coverage),
+                        "reused_completed_checkpoint",
                     )
                     return
                 print(
@@ -1361,8 +1317,10 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                 )
             )
             if covering:
-                data = cache_report_data(
+                emit_cached_report(
                     cache,
+                    output,
+                    window_label,
                     start_ts,
                     end_ts,
                     args.min_comments,
@@ -1371,22 +1329,8 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                     covering["completed_at"],
                     0,
                     0,
-                    0,
                     True,
-                )
-                render_report(data, output, window_label)
-                print(
-                    json.dumps(
-                        {
-                            "report": str(output),
-                            "cache": str(cache_path),
-                            "pages": 0,
-                            "scanned": 0,
-                            "matched": data["candidate_count"],
-                            "cache_hit": True,
-                        },
-                        ensure_ascii=False,
-                    )
+                    "cache_hit",
                 )
                 return
 
@@ -1404,8 +1348,10 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                 end_ts,
                 scan_start_ts,
                 window_label,
-                args.checkpoint_pages,
-                cache_base,
+                cache_reused=bool(cache_base),
+                favorites_complete=(
+                    bool(cache_base["favorites_complete"]) if cache_base else True
+                ),
             )
             checkpoint["cache_path"] = str(cache_path)
             checkpoint["cache_instance_id"] = cache.instance_id
@@ -1427,21 +1373,12 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
 
             browser = BrowserCli(args.session)
             browser.ensure_session()
-            browser.run("goto", "about:blank")
-            browser.run("state-load", native_path(state))
-            browser.run("goto", SITE_URL)
-            snapshot = browser.run("snapshot").stdout
-            if not authenticated(snapshot):
+            if not load_authenticated_state(browser, state):
                 raise CliError("登录已失效或未成功加载，请重新执行 login-open 和 login-save。")
 
-        conditions = []
-        if args.min_comments is not None:
-            conditions.append(f"评论数 > {args.min_comments}")
-        if args.min_favorites is not None:
-            conditions.append(f"收藏数 > {args.min_favorites}")
         print(
             f"开始常驻有限并发扫描：{window_label}，"
-            f"{(' 或 ' if args.match_mode == 'any' else ' 且 ').join(conditions)}，"
+            f"{filter_description(args.min_comments, args.min_favorites, args.match_mode)}，"
             f"并发度 {args.concurrency}，每个请求 0.6–2 秒抖动，"
             f"默认每 {args.checkpoint_pages} 页保存检查点。",
             flush=True,
@@ -1494,8 +1431,7 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
             checkpoint["completed_at"],
             checkpoint["total_pages"],
             checkpoint["total_scanned"],
-            checkpoint["details_requested"],
-            bool(checkpoint.get("cache_base")),
+            bool(checkpoint.get("cache_reused")),
         )
         render_report(data, output, window_label)
         print(

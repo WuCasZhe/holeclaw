@@ -96,36 +96,33 @@ class ThresholdTests(unittest.TestCase):
             200,
             150,
             "test",
-            500,
-            {"favorites_complete": 0},
+            cache_reused=True,
+            favorites_complete=False,
         )
         self.assertFalse(checkpoint["favorites_complete"])
-        self.assertEqual(checkpoint["schema_version"], 3)
+        self.assertTrue(checkpoint["cache_reused"])
+        self.assertEqual(checkpoint["schema_version"], 4)
 
-    def test_v2_checkpoint_matches_are_compacted_to_pids_on_load(self) -> None:
+    def test_legacy_checkpoint_is_rejected_without_modification(self) -> None:
         args = self.parse_run("--min-comments", "50")
         run_digest.resolve_thresholds(args)
         spec = run_digest.window_spec(args)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint.json"
-            checkpoint = run_digest.new_checkpoint(
-                spec, 100, 200, 100, "test", 500, None
-            )
-            checkpoint["schema_version"] = 2
-            checkpoint["matched_by_pid"] = {
-                "123": {
-                    "pid": "123",
-                    "timestamp": 150,
-                    "reply": 100,
-                    "favorites": 20,
-                    "type": "text",
-                    "text": "a long post that should not remain in checkpoint state",
-                }
-            }
+            checkpoint = run_digest.new_checkpoint(spec, 100, 200, 100, "test")
+            checkpoint["schema_version"] = 3
             run_digest.write_checkpoint(path, checkpoint)
-            loaded = run_digest.load_checkpoint(path, spec)
+            before = path.read_bytes()
+            with self.assertRaisesRegex(run_digest.CliError, "incompatible"):
+                run_digest.load_checkpoint(path, spec)
+            self.assertEqual(path.read_bytes(), before)
 
-        self.assertEqual(loaded["matched_by_pid"], {"123": True})
+    def test_default_runtime_paths_are_versioned(self) -> None:
+        self.assertEqual(
+            run_digest.default_cache_path().name, "holeclaw-cache-v5.sqlite3"
+        )
+        checkpoint = run_digest.default_checkpoint_path({"min_comments": 50})
+        self.assertEqual(checkpoint.parent.name, "holeclaw-checkpoints-v4")
 
 
 class StandaloneTests(unittest.TestCase):
@@ -221,6 +218,51 @@ class StandaloneTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_fresh_does_not_overwrite_explicit_legacy_checkpoint(self) -> None:
+        args = run_digest.build_parser().parse_args([
+            "run", "--days", "1", "--min-comments", "100", "--fresh"
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.cache = root / "cache-v5.sqlite3"
+            args.checkpoint = root / "legacy-checkpoint.json"
+            args.output = root / "report.md"
+            args.checkpoint.write_text(
+                '{"schema_version":3,"request":{}}\n', encoding="utf-8"
+            )
+            before = args.checkpoint.read_bytes()
+
+            with self.assertRaisesRegex(run_digest.CliError, "incompatible"):
+                run_digest.run_digest(args)
+
+            self.assertEqual(args.checkpoint.read_bytes(), before)
+            self.assertFalse(args.cache.exists())
+
+    def test_new_default_paths_leave_legacy_runtime_files_untouched(self) -> None:
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_root = root / "output/playwright"
+            legacy_root.mkdir(parents=True)
+            legacy_cache = legacy_root / "holeclaw-cache.sqlite3"
+            legacy_cache.write_bytes(b"legacy-cache")
+            legacy_checkpoint = legacy_root / "holeclaw-checkpoints/legacy.json"
+            legacy_checkpoint.parent.mkdir()
+            legacy_checkpoint.write_bytes(b"legacy-checkpoint")
+            try:
+                run_digest.os.chdir(root)
+                new_cache = run_digest.default_cache_path()
+                new_checkpoint = run_digest.default_checkpoint_path({"min_comments": 50})
+                cache = run_digest.CacheStore(new_cache)
+                cache.close()
+            finally:
+                run_digest.os.chdir(original_cwd)
+
+            self.assertEqual(legacy_cache.read_bytes(), b"legacy-cache")
+            self.assertEqual(legacy_checkpoint.read_bytes(), b"legacy-checkpoint")
+            self.assertTrue(new_cache.is_file())
+            self.assertFalse(new_checkpoint.exists())
+
     def test_standalone_cache_hit_does_not_initialize_browser(self) -> None:
         day = run_digest.datetime.now(run_digest.SHANGHAI).date() - timedelta(days=1)
         args = run_digest.build_parser().parse_args([
@@ -281,7 +323,7 @@ class WorkflowTests(unittest.TestCase):
                 True,
             )
             checkpoint = run_digest.new_checkpoint(
-                spec, old_start, old_end, old_start, label, 500, None
+                spec, old_start, old_end, old_start, label
             )
             checkpoint.update({
                 "completed": True,
@@ -322,6 +364,10 @@ class CacheStoreTests(unittest.TestCase):
                 self.assertNotIn("posts_timestamp_idx", indexes)
                 self.assertNotIn("posts_reply_idx", indexes)
                 self.assertNotIn("posts_favorites_idx", indexes)
+                post_columns = {
+                    row[1] for row in cache.connection.execute("PRAGMA table_info(posts)")
+                }
+                self.assertNotIn("source_page", post_columns)
                 plan = " ".join(
                     str(row[3])
                     for row in cache.connection.execute(
@@ -351,7 +397,6 @@ class CacheStoreTests(unittest.TestCase):
                             "favorites": 10,
                             "type": "text",
                             "text": "one",
-                            "source_page": 1,
                         },
                         {
                             "pid": "2",
@@ -360,7 +405,6 @@ class CacheStoreTests(unittest.TestCase):
                             "favorites": 20,
                             "type": "text",
                             "text": "two",
-                            "source_page": 1,
                         },
                         {
                             "pid": "3",
@@ -369,7 +413,6 @@ class CacheStoreTests(unittest.TestCase):
                             "favorites": 30,
                             "type": "text",
                             "text": "three",
-                            "source_page": 1,
                         },
                     ]
                 )
@@ -386,7 +429,7 @@ class CacheStoreTests(unittest.TestCase):
             finally:
                 cache.close()
 
-    def test_legacy_cache_migration_does_not_claim_favorite_coverage(self) -> None:
+    def test_legacy_cache_is_rejected_without_modification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.sqlite3"
             connection = sqlite3.connect(path)
@@ -413,32 +456,18 @@ class CacheStoreTests(unittest.TestCase):
                 INSERT INTO coverage(
                     start_timestamp, end_timestamp, completed_at, source_pages, source_scanned
                 ) VALUES(100, 200, '2026-08-12T00:00:00+08:00', 1, 1);
+                INSERT INTO metadata(key, value) VALUES('schema_version', '4');
                 """
             )
             connection.commit()
             connection.close()
+            before = path.read_bytes()
 
-            cache = run_digest.CacheStore(path)
-            try:
-                post_columns = {
-                    row[1] for row in cache.connection.execute("PRAGMA table_info(posts)")
-                }
-                coverage_columns = {
-                    row[1] for row in cache.connection.execute("PRAGMA table_info(coverage)")
-                }
-                self.assertIn("favorites", post_columns)
-                self.assertIn("favorites_complete", coverage_columns)
-                self.assertIsNotNone(cache.find_covering(110, 190))
-                self.assertIsNone(cache.find_covering(110, 190, require_favorites=True))
+            with self.assertRaisesRegex(run_digest.CliError, "schema v4"):
+                run_digest.CacheStore(path)
+            self.assertEqual(path.read_bytes(), before)
 
-                cache.add_coverage(100, 200, "2026-08-12T01:00:00+08:00", 1, 1, True)
-                self.assertIsNotNone(
-                    cache.find_covering(110, 190, require_favorites=True)
-                )
-            finally:
-                cache.close()
-
-    def test_explicit_unavailable_rows_make_favorite_coverage_reusable(self) -> None:
+    def test_favorite_coverage_is_only_completed_at_run_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = run_digest.CacheStore(Path(directory) / "cache.sqlite3")
             try:
@@ -450,7 +479,6 @@ class CacheStoreTests(unittest.TestCase):
                         "favorites": 5,
                         "type": "text",
                         "text": "known",
-                        "source_page": 1,
                     },
                     {
                         "pid": "missing",
@@ -459,7 +487,6 @@ class CacheStoreTests(unittest.TestCase):
                         "favorites": None,
                         "type": "image",
                         "text": "",
-                        "source_page": 1,
                     },
                 ])
                 cache.add_coverage(100, 200, "2026-08-12T01:00:00+08:00", 1, 2, False)
@@ -468,14 +495,103 @@ class CacheStoreTests(unittest.TestCase):
                 cache.record_favorite_unavailable([
                     {"pid": "missing", "reason": "detail_missing"}
                 ])
+                self.assertIsNone(
+                    cache.find_covering(110, 190, require_favorites=True)
+                )
+                cache.add_coverage(
+                    100, 200, "2026-08-12T02:00:00+08:00", 1, 2, True
+                )
                 self.assertIsNotNone(
                     cache.find_covering(110, 190, require_favorites=True)
                 )
             finally:
                 cache.close()
 
+    def test_known_favorite_upsert_clears_unavailable_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = run_digest.CacheStore(Path(directory) / "cache.sqlite3")
+            try:
+                cache.upsert_posts([{
+                    "pid": "1",
+                    "timestamp": 150,
+                    "reply": 1,
+                    "favorites": None,
+                    "type": "text",
+                    "text": "post",
+                }])
+                cache.record_favorite_unavailable([{
+                    "pid": "1", "reason": "detail_missing"
+                }])
+                self.assertEqual(len(cache.query_favorite_unavailable(100, 200)), 1)
+
+                cache.upsert_posts([{
+                    "pid": "1",
+                    "timestamp": 150,
+                    "reply": 1,
+                    "favorites": 5,
+                    "type": "text",
+                    "text": "post",
+                }])
+                self.assertEqual(cache.query_favorite_unavailable(100, 200), [])
+            finally:
+                cache.close()
+
 
 class ReportTests(unittest.TestCase):
+    def test_report_matches_golden_markdown(self) -> None:
+        timestamp = int(
+            run_digest.datetime(
+                2026, 8, 12, 10, 30, tzinfo=run_digest.SHANGHAI
+            ).timestamp()
+        )
+        data = {
+            "collected_at": "2026-08-12T12:00:00+08:00",
+            "start_timestamp": int(
+                run_digest.datetime(
+                    2026, 8, 12, tzinfo=run_digest.SHANGHAI
+                ).timestamp()
+            ),
+            "end_timestamp": int(
+                run_digest.datetime(
+                    2026, 8, 13, tzinfo=run_digest.SHANGHAI
+                ).timestamp()
+            ),
+            "min_comments": 4,
+            "min_favorites": None,
+            "match_mode": "all",
+            "pages": 1,
+            "scanned": 1,
+            "candidate_count": 1,
+            "candidates": [{
+                "pid": "123",
+                "timestamp": timestamp,
+                "reply": 5,
+                "favorites": None,
+                "type": "text",
+                "text": "测试帖子",
+            }],
+            "cache_reused": False,
+            "favorite_unavailable": [],
+        }
+        expected = """# 北大树洞高评论帖报告（固定窗口）
+
+- 生成时间：2026-08-12 12:00:00（Asia/Shanghai）
+- 时间范围：2026-08-12 00:00:00 至 2026-08-13 00:00:00
+- 筛选条件：评论数 > 4
+- 本次网络扫描：1 页，1 条帖子
+- 命中：1 条
+
+> 评论数为最近一次采集快照。图片帖默认仅摘要文字说明，不对图片做 OCR。
+
+## 2026-08-12
+
+- **#123** · 5 条评论 · 10:30 — 测试帖子
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.md"
+            run_digest.render_report(data, output, "固定窗口")
+            self.assertEqual(output.read_text(encoding="utf-8"), expected)
+
     def test_favorite_only_report_labels_and_metrics(self) -> None:
         data = {
             "collected_at": "2026-08-12T12:00:00+08:00",
@@ -546,13 +662,13 @@ class RunSinkTests(unittest.TestCase):
             root = Path(directory)
             cache = run_digest.CacheStore(root / "cache.sqlite3")
             checkpoint = run_digest.new_checkpoint(
-                {"min_comments": 10}, 100, 200, 100, "test", 500, None
+                {"min_comments": 10}, 100, 200, 100, "test"
             )
             sink = run_digest.RunSink(
                 cache, checkpoint, root / "checkpoint.json", 10, None
             )
             payload = {
-                "schema_version": 1,
+                "schema_version": run_digest.SINK_SCHEMA_VERSION,
                 "start_page": 1,
                 "end_page": 1,
                 "pages": 1,
@@ -561,22 +677,30 @@ class RunSinkTests(unittest.TestCase):
                     "pid": "rollback",
                     "timestamp": 150,
                     "reply": 1,
-                    "favorites": 0,
+                    "favorites": None,
                     "type": "text",
                     "text": "must roll back",
-                    "source_page": 1,
                 }],
-                "matches": [],
+                "matched_pids": [],
+                "favorite_unavailable": [
+                    {"pid": "rollback", "reason": "detail_missing"}
+                ],
             }
             try:
                 with patch.object(
                     cache,
-                    "record_favorite_unavailable",
+                    "upsert_posts",
                     side_effect=RuntimeError("simulated second write failure"),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "second write failure"):
                         sink.ingest(payload)
                 self.assertEqual(cache.post_count(), 0)
+                self.assertEqual(
+                    cache.connection.execute(
+                        "SELECT COUNT(*) FROM favorite_unavailable"
+                    ).fetchone()[0],
+                    0,
+                )
                 self.assertEqual(checkpoint["next_page"], 1)
             finally:
                 cache.close()
@@ -586,7 +710,7 @@ class RunSinkTests(unittest.TestCase):
             root = Path(directory)
             cache = run_digest.CacheStore(root / "cache.sqlite3")
             checkpoint = run_digest.new_checkpoint(
-                {"min_comments": 0}, 100, 200, 100, "test", 500, None
+                {"min_comments": 0}, 100, 200, 100, "test"
             )
             sink = run_digest.RunSink(
                 cache, checkpoint, root / "checkpoint.json", 0, None
@@ -594,7 +718,40 @@ class RunSinkTests(unittest.TestCase):
             try:
                 with self.assertRaisesRegex(run_digest.CliError, "outside the requested"):
                     sink.ingest({
-                        "schema_version": 1,
+                        "schema_version": run_digest.SINK_SCHEMA_VERSION,
+                        "start_page": 1,
+                        "end_page": 1,
+                        "pages": 1,
+                        "scanned": 1,
+                        "rows": [{
+                            "pid": "1",
+                            "timestamp": 250,
+                            "reply": 1,
+                            "favorites": 0,
+                            "type": "text",
+                            "text": "valid cache row",
+                        }],
+                        "matched_pids": ["1"],
+                    })
+                self.assertEqual(cache.post_count(), 0)
+                self.assertEqual(checkpoint["next_page"], 1)
+            finally:
+                cache.close()
+
+    def test_matched_pid_must_exist_in_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 0}, 100, 200, 100, "test"
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 0, None
+            )
+            try:
+                with self.assertRaisesRegex(run_digest.CliError, "outside its cache rows"):
+                    sink.ingest({
+                        "schema_version": run_digest.SINK_SCHEMA_VERSION,
                         "start_page": 1,
                         "end_page": 1,
                         "pages": 1,
@@ -605,18 +762,44 @@ class RunSinkTests(unittest.TestCase):
                             "reply": 1,
                             "favorites": 0,
                             "type": "text",
-                            "text": "valid cache row",
-                            "source_page": 1,
+                            "text": "row",
                         }],
-                        "matches": [{
-                            "pid": "1",
-                            "timestamp": 250,
-                            "reply": 1,
-                            "favorites": 0,
-                        }],
+                        "matched_pids": ["missing"],
                     })
                 self.assertEqual(cache.post_count(), 0)
                 self.assertEqual(checkpoint["next_page"], 1)
+            finally:
+                cache.close()
+
+    def test_matched_pids_must_use_v2_list_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = run_digest.CacheStore(root / "cache.sqlite3")
+            checkpoint = run_digest.new_checkpoint(
+                {"min_comments": 0}, 100, 200, 100, "test"
+            )
+            sink = run_digest.RunSink(
+                cache, checkpoint, root / "checkpoint.json", 0, None
+            )
+            try:
+                with self.assertRaisesRegex(run_digest.CliError, "invalid matched PIDs"):
+                    sink.ingest({
+                        "schema_version": run_digest.SINK_SCHEMA_VERSION,
+                        "start_page": 1,
+                        "end_page": 1,
+                        "pages": 1,
+                        "scanned": 1,
+                        "rows": [{
+                            "pid": "1",
+                            "timestamp": 150,
+                            "reply": 1,
+                            "favorites": 0,
+                            "type": "text",
+                            "text": "row",
+                        }],
+                        "matched_pids": "1",
+                    })
+                self.assertEqual(cache.post_count(), 0)
             finally:
                 cache.close()
 
@@ -625,14 +808,14 @@ class RunSinkTests(unittest.TestCase):
             root = Path(directory)
             cache = run_digest.CacheStore(root / "cache.sqlite3")
             checkpoint = run_digest.new_checkpoint(
-                {"min_comments": 0}, 100, 200, 100, "test", 500, None
+                {"min_comments": 0}, 100, 200, 100, "test"
             )
             sink = run_digest.RunSink(
                 cache, checkpoint, root / "checkpoint.json", 0, None
             )
             try:
                 sink.ingest({
-                    "schema_version": 1,
+                    "schema_version": run_digest.SINK_SCHEMA_VERSION,
                     "start_page": 1,
                     "end_page": 1,
                     "pages": 1,
@@ -644,16 +827,8 @@ class RunSinkTests(unittest.TestCase):
                         "favorites": 0,
                         "type": "text",
                         "text": "telemetry",
-                        "source_page": 1,
                     }],
-                    "matches": [{
-                        "pid": "1",
-                        "timestamp": 150,
-                        "reply": 1,
-                        "favorites": 0,
-                        "type": "text",
-                        "text": "telemetry",
-                    }],
+                    "matched_pids": ["1"],
                     "telemetry": {
                         "list_requests": 1,
                         "request_ms": 250,
@@ -680,8 +855,6 @@ class RunSinkTests(unittest.TestCase):
                 200,
                 100,
                 "test",
-                500,
-                None,
             )
             sink = run_digest.RunSink(
                 cache, checkpoint, root / "checkpoint.json", None, 10
@@ -689,7 +862,7 @@ class RunSinkTests(unittest.TestCase):
             try:
                 sink.ingest(
                     {
-                        "schema_version": 1,
+                        "schema_version": run_digest.SINK_SCHEMA_VERSION,
                         "start_page": 1,
                         "end_page": 1,
                         "pages": 1,
@@ -702,19 +875,9 @@ class RunSinkTests(unittest.TestCase):
                                 "favorites": 11,
                                 "type": "text",
                                 "text": "match",
-                                "source_page": 1,
                             }
                         ],
-                        "matches": [
-                            {
-                                "pid": "1",
-                                "timestamp": 150,
-                                "reply": 2,
-                                "favorites": 11,
-                                "type": "text",
-                                "text": "match",
-                            }
-                        ],
+                        "matched_pids": ["1"],
                     }
                 )
                 self.assertIn("1", checkpoint["matched_by_pid"])
@@ -722,7 +885,7 @@ class RunSinkTests(unittest.TestCase):
                 with self.assertRaisesRegex(run_digest.CliError, "favorite counts"):
                     sink.ingest(
                         {
-                            "schema_version": 1,
+                            "schema_version": run_digest.SINK_SCHEMA_VERSION,
                             "start_page": 2,
                             "end_page": 2,
                             "pages": 1,
@@ -735,10 +898,9 @@ class RunSinkTests(unittest.TestCase):
                                     "favorites": None,
                                     "type": "text",
                                     "text": "missing",
-                                    "source_page": 2,
                                 }
                             ],
-                            "matches": [],
+                            "matched_pids": [],
                         }
                     )
                 self.assertEqual(cache.post_count(), 1)
@@ -755,15 +917,13 @@ class RunSinkTests(unittest.TestCase):
                 200,
                 100,
                 "test",
-                500,
-                None,
             )
             sink = run_digest.RunSink(
                 cache, checkpoint, root / "checkpoint.json", 100, 45, "any"
             )
             try:
                 sink.ingest({
-                    "schema_version": 1,
+                    "schema_version": run_digest.SINK_SCHEMA_VERSION,
                     "start_page": 1,
                     "end_page": 1,
                     "pages": 1,
@@ -775,16 +935,8 @@ class RunSinkTests(unittest.TestCase):
                         "favorites": None,
                         "type": "image",
                         "text": "",
-                        "source_page": 1,
                     }],
-                    "matches": [{
-                        "pid": "123",
-                        "timestamp": 150,
-                        "reply": 101,
-                        "favorites": None,
-                        "type": "image",
-                        "text": "",
-                    }],
+                    "matched_pids": ["123"],
                     "favorite_unavailable": [
                         {"pid": "123", "reason": "detail_missing"}
                     ],
