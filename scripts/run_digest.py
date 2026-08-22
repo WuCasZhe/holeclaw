@@ -2,29 +2,31 @@
 import argparse
 import hashlib
 import hmac
-import html
 import json
 import os
-import re
 import secrets
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
-from zoneinfo import ZoneInfo
+
+try:
+    from holeclaw_domain import FilterSpec, ReportSpec, SHANGHAI
+    from holeclaw_reporting import one_line_summary, render_report
+except ModuleNotFoundError:
+    from scripts.holeclaw_domain import FilterSpec, ReportSpec, SHANGHAI
+    from scripts.holeclaw_reporting import one_line_summary, render_report
 
 
 SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
-SHANGHAI = ZoneInfo("Asia/Shanghai")
 CACHE_SCHEMA_VERSION = 5
 CHECKPOINT_SCHEMA_VERSION = 4
 SINK_SCHEMA_VERSION = 2
@@ -147,23 +149,29 @@ def time_window(args: argparse.Namespace) -> tuple[int, int, str]:
     now = datetime.now(SHANGHAI)
     if args.since:
         start = datetime.combine(args.since, dt_time.min, SHANGHAI)
-        end_day = args.until or now.date()
-        end = datetime.combine(end_day + timedelta(days=1), dt_time.min, SHANGHAI) if args.until else now
+        requested_end = (
+            datetime.combine(args.until + timedelta(days=1), dt_time.min, SHANGHAI)
+            if args.until
+            else now
+        )
+        end = min(requested_end, now)
         label = f"{start:%Y-%m-%d}至{(end - timedelta(seconds=1)):%Y-%m-%d}"
     else:
         if args.days <= 0:
             raise CliError("--days must be positive.")
-        if args.until:
-            end = datetime.combine(args.until + timedelta(days=1), dt_time.min, SHANGHAI)
-        else:
-            end = now
+        requested_end = (
+            datetime.combine(args.until + timedelta(days=1), dt_time.min, SHANGHAI)
+            if args.until
+            else now
+        )
+        end = min(requested_end, now)
         start = end - timedelta(days=args.days)
         label = f"近{args.days}天"
     if start >= end:
         raise CliError("The start time must be before the end time.")
     if start >= now:
         raise CliError("The requested range is entirely in the future.")
-    return int(start.timestamp()), int(min(end, now).timestamp()), label
+    return int(start.timestamp()), int(end.timestamp()), label
 
 
 def resolve_thresholds(args: argparse.Namespace) -> None:
@@ -521,16 +529,11 @@ class CacheStore:
     ) -> list[dict]:
         filters = ["timestamp >= ?", "timestamp < ?"]
         parameters: list[int] = [start_ts, end_ts]
-        engagement_filters = []
-        if min_comments is not None:
-            engagement_filters.append("reply > ?")
-            parameters.append(min_comments)
-        if min_favorites is not None:
-            engagement_filters.append("favorites > ?")
-            parameters.append(min_favorites)
-        if engagement_filters:
-            joiner = " OR " if match_mode == "any" else " AND "
-            filters.append(f"({joiner.join(engagement_filters)})")
+        filter_spec = FilterSpec(min_comments, min_favorites, match_mode)
+        engagement_filter, engagement_parameters = filter_spec.sql_clause()
+        if engagement_filter:
+            filters.append(engagement_filter)
+            parameters.extend(engagement_parameters)
         with self.lock:
             rows = self.connection.execute(
                 f"""
@@ -635,9 +638,7 @@ class RunSink:
         self.cache = cache
         self.checkpoint = checkpoint
         self.checkpoint_path = checkpoint_path
-        self.min_comments = min_comments
-        self.min_favorites = min_favorites
-        self.match_mode = match_mode
+        self.filter_spec = FilterSpec(min_comments, min_favorites, match_mode)
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.last_progress: dict | None = None
@@ -683,8 +684,9 @@ class RunSink:
             }
             if not unavailable_pids.issubset(missing_favorite_pids):
                 raise CliError("Collector marked a known favorite count as unavailable.")
-            if self.min_favorites is not None and not missing_favorite_pids.issubset(
-                unavailable_pids
+            if (
+                self.filter_spec.min_favorites is not None
+                and not missing_favorite_pids.issubset(unavailable_pids)
             ):
                 raise CliError("Collector omitted favorite counts or availability metadata.")
 
@@ -699,16 +701,7 @@ class RunSink:
                 raw_favorites = post.get("favorites")
                 favorites = None if raw_favorites is None else int(raw_favorites)
                 normalized_pid = str(pid)
-                conditions = []
-                if self.min_comments is not None:
-                    conditions.append(reply > self.min_comments)
-                if self.min_favorites is not None:
-                    conditions.append(
-                        favorites is not None and favorites > self.min_favorites
-                    )
-                engagement_match = (
-                    any(conditions) if self.match_mode == "any" else all(conditions)
-                )
+                engagement_match = self.filter_spec.matches(reply, favorites)
                 if (
                     not normalized_pid
                     or not (report_start <= timestamp < report_end)
@@ -726,7 +719,7 @@ class RunSink:
             cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
             chunk_telemetry["cache_write_ms"] = cache_write_ms
             merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            if missing_favorite_pids and self.min_favorites is None:
+            if missing_favorite_pids and self.filter_spec.min_favorites is None:
                 self.checkpoint["favorites_complete"] = False
             for pid in validated_match_pids:
                 self.checkpoint["matched_by_pid"][pid] = True
@@ -744,24 +737,11 @@ class RunSink:
                 "matched": len(self.checkpoint["matched_by_pid"]),
                 "oldest": int(payload.get("oldest", 0)),
             }
-            terminal_result = payload.get("result")
             if payload.get("terminal"):
-                if not isinstance(terminal_result, dict):
-                    raise CliError("Collector terminal chunk is missing its result.")
-                if (
-                    int(terminal_result.get("batch_end_page", 0)) != end_page
-                    or int(terminal_result.get("next_page", 0)) != end_page + 1
-                    or int(terminal_result.get("pages", 0)) <= 0
-                    or int(terminal_result.get("scanned", -1)) < scanned
-                    or bool(terminal_result.get("reached_start"))
-                    != bool(payload.get("reached_start"))
-                    or bool(terminal_result.get("feed_exhausted"))
-                    != bool(payload.get("feed_exhausted"))
-                ):
-                    raise CliError("Collector terminal result does not match its cache chunk.")
-                self.terminal_result = dict(terminal_result)
-            elif terminal_result is not None:
-                raise CliError("Collector returned a result before the terminal chunk.")
+                self.terminal_result = {
+                    "reached_start": bool(payload.get("reached_start")),
+                    "feed_exhausted": bool(payload.get("feed_exhausted")),
+                }
             if payload.get("checkpoint") or payload.get("terminal"):
                 write_checkpoint(self.checkpoint_path, self.checkpoint)
             self.progress_sequence += 1
@@ -856,155 +836,55 @@ class SinkServer:
         self.thread.join(timeout=5)
 
 
-def one_line_summary(text: str, post_type: str) -> str:
-    original = re.sub(r"\s+", " ", html.unescape(text or "")).strip()
-    value = re.sub(r"https?://\S+", "[链接]", original).replace("|", "｜")
-    if not value:
-        value = "帖子没有文字说明"
-    if len(value) > 120:
-        clauses = re.split(r"(?<=[。！？!?；;])", value)
-        picked = ""
-        for clause in clauses:
-            if picked and len(picked) + len(clause) > 112:
-                break
-            picked += clause
-            if len(picked) >= 45:
-                break
-        value = (picked or value[:112]).strip().rstrip("。！？!?；;") + "…"
-    if post_type == "image":
-        value = f"[图片帖] {value}"
-    return value
-
-
 def report_profile(
     min_comments: int | None, min_favorites: int | None, match_mode: str
 ) -> tuple[str, str]:
-    if min_comments is not None and min_favorites is not None and match_mode == "any":
-        return "high-comments-or-favorites", "北大树洞高评论或高收藏帖报告"
-    if min_comments is not None and min_favorites is not None:
-        return "high-comments-and-favorites", "北大树洞高评论与高收藏帖报告"
-    if min_favorites is not None:
-        return "high-favorites", "北大树洞高收藏帖报告"
-    return "high-comments", "北大树洞高评论帖报告"
+    return FilterSpec(min_comments, min_favorites, match_mode).report_profile()
 
 
 def filter_description(
     min_comments: int | None, min_favorites: int | None, match_mode: str
 ) -> str:
-    conditions = []
-    if min_comments is not None:
-        conditions.append(f"评论数 > {min_comments}")
-    if min_favorites is not None:
-        conditions.append(f"收藏数 > {min_favorites}")
-    return (" 或 " if match_mode == "any" else " 且 ").join(conditions)
+    return FilterSpec(min_comments, min_favorites, match_mode).description()
 
 
 def cache_report_data(
     cache: CacheStore,
-    start_ts: int,
-    end_ts: int,
-    min_comments: int | None,
-    min_favorites: int | None,
-    match_mode: str,
+    report: ReportSpec,
     collected_at: str,
     pages: int,
     scanned: int,
     cache_reused: bool,
 ) -> dict:
+    filters = report.filters
     candidates = cache.query_posts(
-        start_ts, end_ts, min_comments, min_favorites, match_mode
+        report.start_ts,
+        report.end_ts,
+        filters.min_comments,
+        filters.min_favorites,
+        filters.match_mode,
     )
     return {
         "collected_at": collected_at,
-        "start_timestamp": start_ts,
-        "end_timestamp": end_ts,
-        "min_comments": min_comments,
-        "min_favorites": min_favorites,
-        "match_mode": match_mode,
+        "start_timestamp": report.start_ts,
+        "end_timestamp": report.end_ts,
+        "min_comments": filters.min_comments,
+        "min_favorites": filters.min_favorites,
+        "match_mode": filters.match_mode,
         "pages": pages,
         "scanned": scanned,
         "candidate_count": len(candidates),
         "candidates": candidates,
         "cache_reused": cache_reused,
-        "favorite_unavailable": cache.query_favorite_unavailable(start_ts, end_ts),
+        "favorite_unavailable": cache.query_favorite_unavailable(
+            report.start_ts, report.end_ts
+        ),
     }
-
-
-def render_report(data: dict, output: Path, window_label: str) -> None:
-    grouped = defaultdict(list)
-    for post in data["candidates"]:
-        local_time = datetime.fromtimestamp(int(post["timestamp"]), SHANGHAI)
-        grouped[local_time.date().isoformat()].append((local_time, post))
-
-    collected = datetime.fromisoformat(data["collected_at"].replace("Z", "+00:00")).astimezone(SHANGHAI)
-    start = datetime.fromtimestamp(data["start_timestamp"], SHANGHAI)
-    end = datetime.fromtimestamp(data["end_timestamp"], SHANGHAI)
-    min_comments = data["min_comments"]
-    min_favorites = data["min_favorites"]
-    match_mode = data.get("match_mode", "all")
-    _slug, title = report_profile(min_comments, min_favorites, match_mode)
-    lines = [
-        f"# {title}（{window_label}）",
-        "",
-        f"- 生成时间：{collected:%Y-%m-%d %H:%M:%S}（Asia/Shanghai）",
-        f"- 时间范围：{start:%Y-%m-%d %H:%M:%S} 至 {end:%Y-%m-%d %H:%M:%S}",
-    ]
-    lines.extend(
-        [
-            f"- 筛选条件：{filter_description(min_comments, min_favorites, match_mode)}",
-            f"- 本次网络扫描：{data['pages']} 页，{data['scanned']:,} 条帖子",
-            f"- 命中：{data['candidate_count']} 条",
-        ]
-    )
-    if data.get("cache_reused"):
-        lines.append("- 数据来源：SQLite 本地缓存（必要的新时间段已增量扫描）")
-    unavailable = data.get("favorite_unavailable") or []
-    if min_favorites is not None and unavailable:
-        unavailable_pids = "、".join(f"#{item['pid']}" for item in unavailable)
-        lines.append(
-            f"- 收藏数不可用：{len(unavailable)} 条（{unavailable_pids}）；"
-            "不按收藏条件命中，但在 OR 模式下仍可按评论条件命中"
-        )
-    has_favorite_snapshots = min_favorites is not None or any(
-        post.get("favorites") is not None for post in data["candidates"]
-    )
-    snapshot_note = (
-        "评论数和收藏数为最近一次采集快照。"
-        if has_favorite_snapshots
-        else "评论数为最近一次采集快照。"
-    )
-    lines.extend(
-        [
-            "",
-            f"> {snapshot_note}图片帖默认仅摘要文字说明，不对图片做 OCR。",
-            "",
-        ]
-    )
-    for day in sorted(grouped, reverse=True):
-        lines.extend([f"## {day}", ""])
-        for local_time, post in grouped[day]:
-            summary = one_line_summary(post.get("text", ""), post.get("type", "text"))
-            metrics = [f"{post['reply']} 条评论"]
-            if post.get("favorites") is not None:
-                metrics.append(f"{post['favorites']} 次收藏")
-            lines.append(
-                f"- **#{post['pid']}** · {' · '.join(metrics)} · "
-                f"{local_time:%H:%M} — {summary}"
-            )
-        lines.append("")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def emit_cached_report(
     cache: CacheStore,
-    output: Path,
-    window_label: str,
-    start_ts: int,
-    end_ts: int,
-    min_comments: int | None,
-    min_favorites: int | None,
-    match_mode: str,
+    report: ReportSpec,
     collected_at: str,
     pages: int,
     scanned: int,
@@ -1012,20 +892,11 @@ def emit_cached_report(
     marker: str,
 ) -> None:
     data = cache_report_data(
-        cache,
-        start_ts,
-        end_ts,
-        min_comments,
-        min_favorites,
-        match_mode,
-        collected_at,
-        pages,
-        scanned,
-        cache_reused,
+        cache, report, collected_at, pages, scanned, cache_reused
     )
-    render_report(data, output, window_label)
+    render_report(data, report.output, report.window_label)
     summary = {
-        "report": str(output),
+        "report": str(report.output),
         "cache": str(cache.path),
         "pages": data["pages"],
         "scanned": data["scanned"],
@@ -1201,11 +1072,9 @@ def run_persistent_collector(
     stdout = process_output.get("stdout", "")
     stderr = process_output.get("stderr", "")
     if process.returncode != 0:
-        sink.flush()
         raise CliError((stdout + "\n" + stderr).strip()[-3000:])
     data = sink.result()
     if data is None:
-        sink.flush()
         message = (stdout + "\n" + stderr).strip()[-2000:]
         raise CliError(message or "Collector exited without a terminal result.")
     return data
@@ -1221,9 +1090,6 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         raise CliError("--max-total-pages must be between 1 and 5000.")
     if args.concurrency <= 0 or args.concurrency > 4:
         raise CliError("--concurrency must be between 1 and 4.")
-    if args.max_pages is not None:
-        print("提示：--max-pages 已由常驻采集器取代；请使用 --max-total-pages。", flush=True)
-
     spec = window_spec(args)
     start_ts, end_ts, window_label = time_window(args)
     checkpoint_path = (args.checkpoint or default_checkpoint_path(spec)).resolve()
@@ -1283,15 +1149,12 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                     coverage = cache.find_covering(
                         start_ts, end_ts, require_favorites=args.min_favorites is not None
                     )
+                    report = ReportSpec.from_args(
+                        args, output, window_label, start_ts, end_ts
+                    )
                     emit_cached_report(
                         cache,
-                        output,
-                        window_label,
-                        start_ts,
-                        end_ts,
-                        args.min_comments,
-                        args.min_favorites,
-                        args.match_mode,
+                        report,
                         coverage["completed_at"]
                         if coverage
                         else checkpoint.get("completed_at", checkpoint["updated_at"]),
@@ -1317,15 +1180,12 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                 )
             )
             if covering:
+                report = ReportSpec.from_args(
+                    args, output, window_label, start_ts, end_ts
+                )
                 emit_cached_report(
                     cache,
-                    output,
-                    window_label,
-                    start_ts,
-                    end_ts,
-                    args.min_comments,
-                    args.min_favorites,
-                    args.match_mode,
+                    report,
                     covering["completed_at"],
                     0,
                     0,
@@ -1421,13 +1281,10 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
             checkpoint["total_scanned"],
             checkpoint["favorites_complete"],
         )
+        report = ReportSpec.from_args(args, output, window_label, start_ts, end_ts)
         data = cache_report_data(
             cache,
-            start_ts,
-            end_ts,
-            args.min_comments,
-            args.min_favorites,
-            args.match_mode,
+            report,
             checkpoint["completed_at"],
             checkpoint["total_pages"],
             checkpoint["total_scanned"],
@@ -1470,7 +1327,6 @@ def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
         default="all",
         help="Require all thresholds (AND) or any threshold (OR)",
     )
-    parser.add_argument("--max-pages", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--checkpoint-pages", type=int, default=500)
     parser.add_argument("--cache-chunk-pages", type=int, default=1)
     parser.add_argument(

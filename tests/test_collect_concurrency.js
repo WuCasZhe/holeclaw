@@ -1,13 +1,6 @@
 #!/usr/bin/env node
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-
-const collectorPath = path.join(__dirname, '..', 'scripts', 'collect.js');
-const collector = vm.runInThisContext(fs.readFileSync(collectorPath, 'utf8'), {
-  filename: collectorPath,
-});
+const { response, runCollector } = require('./collector_harness');
 
 const config = {
   report_start_timestamp: 100,
@@ -28,31 +21,12 @@ const config = {
   sink_url: 'http://127.0.0.1:12345/ingest?token=test',
 };
 
-const sinkPayloads = [];
 const completionOrder = [];
 let remoteInFlight = 0;
 let maxRemoteInFlight = 0;
 
-const response = (body) => ({
-  status: 200,
-  ok: true,
-  headers: { get: () => null },
-  text: async () => JSON.stringify(body),
-});
-
-const originalFetch = global.fetch;
-const originalSetTimeout = global.setTimeout;
-global.setTimeout = (callback) => {
-  callback();
-  return 0;
-};
-global.fetch = async (url, options = {}) => {
+const remoteFetch = async (url) => {
   const value = String(url);
-  if (value.startsWith(config.sink_url)) {
-    sinkPayloads.push(JSON.parse(options.body));
-    return response({ ok: true });
-  }
-
   const pageNumber = Number(new URL(value, 'https://treehole.pku.edu.cn').searchParams.get('page'));
   remoteInFlight += 1;
   maxRemoteInFlight = Math.max(maxRemoteInFlight, remoteInFlight);
@@ -78,21 +52,8 @@ global.fetch = async (url, options = {}) => {
   return response({ code: 20000, data: { list: posts } });
 };
 
-let evaluateCount = 0;
-const page = {
-  evaluate: async (fn, argument) => {
-    evaluateCount += 1;
-    return evaluateCount === 1 ? config : fn(argument);
-  },
-  waitForRequest: async () => ({
-    allHeaders: async () => ({ authorization: 'test-token' }),
-  }),
-  reload: async () => undefined,
-};
-
 (async () => {
-  try {
-    const result = await collector(page);
+    const { result, sinkPayloads } = await runCollector({ config, remoteFetch });
     assert.equal(maxRemoteInFlight, 3, 'list requests should overlap within the configured cap');
     assert.equal(completionOrder.at(-1), 1, 'the mock should complete page 1 out of order');
     assert.deepEqual(
@@ -115,10 +76,10 @@ const page = {
         payload.rows.every((row) => !Object.hasOwn(row, 'source_page'))),
       'source_page must remain page-local collector state',
     );
-    assert.deepEqual(
-      Object.keys(sinkPayloads.at(-1).result).sort(),
-      ['batch_end_page', 'feed_exhausted', 'next_page', 'pages', 'reached_start', 'scanned'],
-      'terminal result must contain only fields consumed by the sink',
+    assert.equal(
+      Object.hasOwn(sinkPayloads.at(-1), 'result'),
+      false,
+      'terminal state must not be duplicated in a nested result',
     );
     assert.equal(
       sinkPayloads.reduce(
@@ -133,10 +94,6 @@ const page = {
       3,
     );
     process.stdout.write('collect concurrency smoke test: ok\n');
-  } finally {
-    global.fetch = originalFetch;
-    global.setTimeout = originalSetTimeout;
-  }
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

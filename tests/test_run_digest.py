@@ -84,6 +84,15 @@ class ThresholdTests(unittest.TestCase):
         self.assertFalse(run_digest.is_rolling_window(fixed))
         self.assertTrue(run_digest.should_reuse_checkpoint(fixed, completed))
 
+    def test_future_until_keeps_the_requested_rolling_duration(self) -> None:
+        tomorrow = run_digest.datetime.now(run_digest.SHANGHAI).date() + timedelta(days=1)
+        args = self.parse_run("--days", "30", "--until", tomorrow.isoformat())
+
+        start, end, label = run_digest.time_window(args)
+
+        self.assertEqual(end - start, 30 * 24 * 60 * 60)
+        self.assertEqual(label, "近30天")
+
     def test_negative_favorite_threshold_is_rejected(self) -> None:
         args = self.parse_run("--min-favorites", "-1")
         with self.assertRaisesRegex(run_digest.CliError, "--min-favorites"):

@@ -132,6 +132,14 @@ async (page) => {
           }
         };
 
+        const retryAfterMilliseconds = (rawValue) => {
+          if (!rawValue) return 0;
+          const seconds = Number(rawValue);
+          if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+          const retryAt = Date.parse(rawValue);
+          return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : 0;
+        };
+
         const requestJson = async (url, label) => {
           let result = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -182,7 +190,7 @@ async (page) => {
               }
             }
             if (!transient || attempt === 2) break;
-            const serverDelay = Number(result.retryAfter || 0) * 1000;
+            const serverDelay = retryAfterMilliseconds(result.retryAfter);
             const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
             const backoffMilliseconds = Math.min(60_000, backoff);
             cooldownUntil = Math.max(cooldownUntil, Date.now() + backoffMilliseconds);
@@ -356,16 +364,6 @@ async (page) => {
             const chunkFull = pages % cacheChunkPages === 0;
 
             if (chunkFull || terminal || checkpoint) {
-              const result = terminal
-                ? {
-                    batch_end_page: pageNumber,
-                    next_page: pageNumber + 1,
-                    pages,
-                    scanned,
-                    reached_start: reachedStart,
-                    feed_exhausted: feedExhausted,
-                  }
-                : null;
               chunkTelemetry.wall_ms = Math.max(
                 0,
                 Math.round(performance.now() - chunkWallStartedAt),
@@ -381,7 +379,6 @@ async (page) => {
                 feed_exhausted: feedExhausted,
                 checkpoint,
                 terminal,
-                result,
                 rows: pendingRows,
                 matched_pids: [...pendingMatchedPids],
                 favorite_unavailable: [...pendingUnavailableByPid.values()],
