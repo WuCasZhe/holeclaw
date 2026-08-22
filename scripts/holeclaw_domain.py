@@ -5,6 +5,28 @@ from zoneinfo import ZoneInfo
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+CACHE_SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 4
+SINK_SCHEMA_VERSION = 2
+TELEMETRY_FIELDS = (
+    "list_requests",
+    "detail_requests",
+    "request_ms",
+    "pacing_ms",
+    "retry_backoff_ms",
+    "response_chars",
+    "cache_write_ms",
+    "wall_ms",
+    "throttle_responses",
+    "concurrency_reductions",
+    "max_in_flight",
+    "overfetch_pages",
+)
+TELEMETRY_MAX_FIELDS = {"max_in_flight"}
+
+
+class CliError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)

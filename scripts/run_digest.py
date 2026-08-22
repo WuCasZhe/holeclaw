@@ -1,54 +1,67 @@
 #!/usr/bin/env python3
 import argparse
-import hashlib
-import hmac
 import json
 import os
-import secrets
-import sqlite3
 import subprocess
 import sys
 import threading
-import time
-from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
-    from holeclaw_domain import FilterSpec, ReportSpec, SHANGHAI
+    from holeclaw_cache import CacheStore
+    from holeclaw_checkpoint import (
+        default_cache_path,
+        default_checkpoint_path,
+        empty_telemetry,
+        load_checkpoint,
+        merge_telemetry,
+        new_checkpoint,
+        read_checkpoint,
+        write_checkpoint,
+    )
+    from holeclaw_domain import (
+        CACHE_SCHEMA_VERSION,
+        CHECKPOINT_SCHEMA_VERSION,
+        SINK_SCHEMA_VERSION,
+        TELEMETRY_FIELDS,
+        TELEMETRY_MAX_FIELDS,
+        CliError,
+        FilterSpec,
+        ReportSpec,
+        SHANGHAI,
+    )
     from holeclaw_reporting import one_line_summary, render_report
+    from holeclaw_sink import SITE_ORIGIN, RunSink, SinkServer
 except ModuleNotFoundError:
-    from scripts.holeclaw_domain import FilterSpec, ReportSpec, SHANGHAI
+    from scripts.holeclaw_cache import CacheStore
+    from scripts.holeclaw_checkpoint import (
+        default_cache_path,
+        default_checkpoint_path,
+        empty_telemetry,
+        load_checkpoint,
+        merge_telemetry,
+        new_checkpoint,
+        read_checkpoint,
+        write_checkpoint,
+    )
+    from scripts.holeclaw_domain import (
+        CACHE_SCHEMA_VERSION,
+        CHECKPOINT_SCHEMA_VERSION,
+        SINK_SCHEMA_VERSION,
+        TELEMETRY_FIELDS,
+        TELEMETRY_MAX_FIELDS,
+        CliError,
+        FilterSpec,
+        ReportSpec,
+        SHANGHAI,
+    )
     from scripts.holeclaw_reporting import one_line_summary, render_report
+    from scripts.holeclaw_sink import SITE_ORIGIN, RunSink, SinkServer
 
 
 SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
-SITE_ORIGIN = "https://treehole.pku.edu.cn"
 CONFIG_KEY = "codex_pku_digest_config"
-CACHE_SCHEMA_VERSION = 5
-CHECKPOINT_SCHEMA_VERSION = 4
-SINK_SCHEMA_VERSION = 2
-TELEMETRY_FIELDS = (
-    "list_requests",
-    "detail_requests",
-    "request_ms",
-    "pacing_ms",
-    "retry_backoff_ms",
-    "response_chars",
-    "cache_write_ms",
-    "wall_ms",
-    "throttle_responses",
-    "concurrency_reductions",
-    "max_in_flight",
-    "overfetch_pages",
-)
-TELEMETRY_MAX_FIELDS = {"max_in_flight"}
-
-
-class CliError(RuntimeError):
-    pass
 
 
 def codex_base() -> Path:
@@ -210,631 +223,6 @@ def is_rolling_window(args: argparse.Namespace) -> bool:
 def should_reuse_checkpoint(args: argparse.Namespace, checkpoint: dict) -> bool:
     """Resume unfinished work, but never let a completed run freeze a rolling window."""
     return not checkpoint.get("completed", False) or not is_rolling_window(args)
-
-
-def empty_telemetry() -> dict[str, int]:
-    return {field: 0 for field in TELEMETRY_FIELDS}
-
-
-def merge_telemetry(target: dict, update: dict) -> None:
-    for field in TELEMETRY_FIELDS:
-        raw_value = update.get(field, 0)
-        if isinstance(raw_value, bool):
-            raise CliError("Collector returned invalid telemetry.")
-        try:
-            value = int(raw_value)
-        except (TypeError, ValueError) as error:
-            raise CliError("Collector returned invalid telemetry.") from error
-        if value < 0:
-            raise CliError("Collector returned invalid telemetry.")
-        if field in TELEMETRY_MAX_FIELDS:
-            target[field] = max(int(target.get(field, 0)), value)
-        else:
-            target[field] = int(target.get(field, 0)) + value
-
-
-def default_checkpoint_path(spec: dict) -> Path:
-    fingerprint = hashlib.sha256(
-        json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
-    return Path.cwd() / "output/playwright/holeclaw-checkpoints-v4" / f"{fingerprint}.json"
-
-
-def default_cache_path() -> Path:
-    return Path.cwd() / "output/playwright/holeclaw-cache-v5.sqlite3"
-
-
-def write_checkpoint(path: Path, checkpoint: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
-    path.chmod(0o600)
-
-
-def new_checkpoint(
-    spec: dict,
-    start_ts: int,
-    end_ts: int,
-    scan_start_ts: int,
-    window_label: str,
-    cache_reused: bool = False,
-    favorites_complete: bool = True,
-) -> dict:
-    now = datetime.now(SHANGHAI).isoformat()
-    return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "request": spec,
-        "start_timestamp": start_ts,
-        "end_timestamp": end_ts,
-        "scan_start_timestamp": scan_start_ts,
-        "window_label": window_label,
-        "cache_reused": cache_reused,
-        "next_page": 1,
-        "total_pages": 0,
-        "total_scanned": 0,
-        "matched_by_pid": {},
-        "telemetry": empty_telemetry(),
-        "favorites_complete": favorites_complete,
-        "reached_start": False,
-        "feed_exhausted": False,
-        "completed": False,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-
-def read_checkpoint(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise CliError(f"Cannot read checkpoint {path}: {error}") from error
-
-
-def load_checkpoint(path: Path, spec: dict) -> dict:
-    checkpoint = read_checkpoint(path)
-    if (
-        checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION
-        or checkpoint.get("request") != spec
-    ):
-        raise CliError(
-            f"Checkpoint is incompatible or parameters do not match: {path}. "
-            "Use a new checkpoint path."
-        )
-    return checkpoint
-
-
-class CacheStore:
-    def __init__(self, path: Path):
-        self.path = path.resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            try:
-                inspection = sqlite3.connect(
-                    f"file:{self.path}?mode=ro", uri=True, timeout=5
-                )
-                try:
-                    schema_row = inspection.execute(
-                        "SELECT value FROM metadata WHERE key='schema_version'"
-                    ).fetchone()
-                finally:
-                    inspection.close()
-                schema_version = int(schema_row[0]) if schema_row else 0
-            except (sqlite3.Error, TypeError, ValueError) as error:
-                raise CliError(
-                    f"Cache is incompatible with schema v{CACHE_SCHEMA_VERSION}: {self.path}. "
-                    "Use a new cache path."
-                ) from error
-            if schema_version != CACHE_SCHEMA_VERSION:
-                raise CliError(
-                    f"Cache schema v{schema_version} is incompatible with schema "
-                    f"v{CACHE_SCHEMA_VERSION}: {self.path}. Use a new cache path."
-                )
-        self.lock = threading.RLock()
-        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
-        self.connection.row_factory = sqlite3.Row
-        with self.lock:
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=NORMAL")
-            self.connection.execute("PRAGMA temp_store=MEMORY")
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS posts (
-                    pid TEXT PRIMARY KEY,
-                    timestamp INTEGER NOT NULL,
-                    reply INTEGER NOT NULL,
-                    favorites INTEGER,
-                    type TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    observed_at INTEGER NOT NULL
-                )
-                """
-            )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS posts_window_idx "
-                "ON posts(timestamp DESC, pid DESC)"
-            )
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS coverage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    start_timestamp INTEGER NOT NULL,
-                    end_timestamp INTEGER NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    source_pages INTEGER NOT NULL,
-                    source_scanned INTEGER NOT NULL,
-                    favorites_complete INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS favorite_unavailable (
-                    pid TEXT PRIMARY KEY,
-                    observed_at INTEGER NOT NULL,
-                    reason TEXT NOT NULL
-                )
-                """
-            )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS coverage_window_idx "
-                "ON coverage(start_timestamp, end_timestamp)"
-            )
-            self.connection.execute(
-                "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
-                (str(CACHE_SCHEMA_VERSION),),
-            )
-            instance_row = self.connection.execute(
-                "SELECT value FROM metadata WHERE key='instance_id'"
-            ).fetchone()
-            if instance_row:
-                self.instance_id = str(instance_row[0])
-            else:
-                self.instance_id = secrets.token_hex(16)
-                self.connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES('instance_id', ?)",
-                    (self.instance_id,),
-                )
-            self.connection.commit()
-        self.path.chmod(0o600)
-
-    def close(self) -> None:
-        with self.lock:
-            self.connection.commit()
-            self.connection.close()
-        self.path.chmod(0o600)
-
-    @contextmanager
-    def transaction(self):
-        """Serialize a cache chunk and commit it as one SQLite transaction."""
-        with self.lock:
-            try:
-                yield
-            except Exception:
-                self.connection.rollback()
-                raise
-            else:
-                self.connection.commit()
-
-    def upsert_posts(self, rows: list[dict], *, commit: bool = True) -> None:
-        if not rows:
-            return
-        observed_at = int(datetime.now(SHANGHAI).timestamp())
-        values = []
-        for row in rows:
-            pid = str(row.get("pid", ""))
-            timestamp = int(row.get("timestamp", 0))
-            reply = int(row.get("reply", 0))
-            raw_favorites = row.get("favorites")
-            favorites = None if raw_favorites is None else int(raw_favorites)
-            if (
-                not pid
-                or timestamp <= 0
-                or reply < 0
-                or (favorites is not None and favorites < 0)
-            ):
-                raise CliError("Collector returned an invalid cache row.")
-            values.append(
-                (
-                    pid,
-                    timestamp,
-                    reply,
-                    favorites,
-                    str(row.get("type") or "text"),
-                    str(row.get("text") or ""),
-                    observed_at,
-                )
-            )
-        with self.lock:
-            self.connection.executemany(
-                """
-                INSERT INTO posts(
-                    pid, timestamp, reply, favorites, type, text, observed_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pid) DO UPDATE SET
-                    timestamp=excluded.timestamp,
-                    reply=excluded.reply,
-                    favorites=CASE
-                        WHEN excluded.favorites IS NOT NULL THEN excluded.favorites
-                        ELSE posts.favorites
-                    END,
-                    type=excluded.type,
-                    text=CASE WHEN excluded.text <> '' THEN excluded.text ELSE posts.text END,
-                    observed_at=excluded.observed_at
-                """,
-                values,
-            )
-            input_pids = [value[0] for value in values]
-            if input_pids:
-                self.connection.executemany(
-                    """
-                    DELETE FROM favorite_unavailable
-                    WHERE pid = ?
-                      AND EXISTS (
-                          SELECT 1 FROM posts
-                          WHERE posts.pid = ? AND posts.favorites IS NOT NULL
-                      )
-                    """,
-                    ((pid, pid) for pid in input_pids),
-                )
-            if commit:
-                self.connection.commit()
-
-    def record_favorite_unavailable(
-        self, rows: list[dict], *, commit: bool = True
-    ) -> None:
-        if not rows:
-            return
-        observed_at = int(datetime.now(SHANGHAI).timestamp())
-        values = []
-        for row in rows:
-            pid = str(row.get("pid", ""))
-            reason = str(row.get("reason") or "detail_missing")
-            if not pid:
-                raise CliError("Collector returned an invalid unavailable favorite PID.")
-            values.append((pid, observed_at, reason[:120]))
-        with self.lock:
-            self.connection.executemany(
-                """
-                INSERT INTO favorite_unavailable(pid, observed_at, reason)
-                VALUES(?, ?, ?)
-                ON CONFLICT(pid) DO UPDATE SET
-                    observed_at=excluded.observed_at,
-                    reason=excluded.reason
-                """,
-                values,
-            )
-            if commit:
-                self.connection.commit()
-
-    def query_posts(
-        self,
-        start_ts: int,
-        end_ts: int,
-        min_comments: int | None,
-        min_favorites: int | None,
-        match_mode: str = "all",
-    ) -> list[dict]:
-        filters = ["timestamp >= ?", "timestamp < ?"]
-        parameters: list[int] = [start_ts, end_ts]
-        filter_spec = FilterSpec(min_comments, min_favorites, match_mode)
-        engagement_filter, engagement_parameters = filter_spec.sql_clause()
-        if engagement_filter:
-            filters.append(engagement_filter)
-            parameters.extend(engagement_parameters)
-        with self.lock:
-            rows = self.connection.execute(
-                f"""
-                SELECT pid, timestamp, reply, favorites, type, text
-                FROM posts
-                WHERE {' AND '.join(filters)}
-                ORDER BY timestamp DESC, pid DESC
-                """,
-                parameters,
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def query_favorite_unavailable(self, start_ts: int, end_ts: int) -> list[dict]:
-        with self.lock:
-            rows = self.connection.execute(
-                """
-                SELECT p.pid, p.timestamp, p.reply, p.type, p.text,
-                       u.observed_at, u.reason
-                FROM favorite_unavailable AS u
-                JOIN posts AS p ON p.pid = u.pid
-                WHERE p.timestamp >= ? AND p.timestamp < ?
-                ORDER BY p.timestamp DESC, p.pid DESC
-                """,
-                (start_ts, end_ts),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
-    def find_covering(
-        self, start_ts: int, end_ts: int, require_favorites: bool = False
-    ) -> dict | None:
-        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
-        with self.lock:
-            row = self.connection.execute(
-                f"""
-                SELECT * FROM coverage
-                WHERE start_timestamp <= ? AND end_timestamp >= ?
-                {favorites_clause}
-                ORDER BY end_timestamp DESC, completed_at DESC
-                LIMIT 1
-                """,
-                (start_ts, end_ts),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def find_prefix(
-        self, start_ts: int, end_ts: int, require_favorites: bool = False
-    ) -> dict | None:
-        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
-        with self.lock:
-            row = self.connection.execute(
-                f"""
-                SELECT * FROM coverage
-                WHERE start_timestamp <= ? AND end_timestamp > ? AND end_timestamp < ?
-                {favorites_clause}
-                ORDER BY end_timestamp DESC, completed_at DESC
-                LIMIT 1
-                """,
-                (start_ts, start_ts, end_ts),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def add_coverage(
-        self,
-        start_ts: int,
-        end_ts: int,
-        completed_at: str,
-        pages: int,
-        scanned: int,
-        favorites_complete: bool,
-    ) -> None:
-        with self.lock:
-            self.connection.execute(
-                """
-                INSERT INTO coverage(
-                    start_timestamp, end_timestamp, completed_at, source_pages, source_scanned,
-                    favorites_complete
-                ) VALUES(?, ?, ?, ?, ?, ?)
-                """,
-                (start_ts, end_ts, completed_at, pages, scanned, int(favorites_complete)),
-            )
-            self.connection.commit()
-
-    def integrity_check(self) -> str:
-        with self.lock:
-            return str(self.connection.execute("PRAGMA integrity_check").fetchone()[0])
-
-    def post_count(self) -> int:
-        with self.lock:
-            return int(self.connection.execute("SELECT COUNT(*) FROM posts").fetchone()[0])
-
-
-class RunSink:
-    def __init__(
-        self,
-        cache: CacheStore,
-        checkpoint: dict,
-        checkpoint_path: Path,
-        min_comments: int | None,
-        min_favorites: int | None,
-        match_mode: str = "all",
-    ):
-        self.cache = cache
-        self.checkpoint = checkpoint
-        self.checkpoint_path = checkpoint_path
-        self.filter_spec = FilterSpec(min_comments, min_favorites, match_mode)
-        self.lock = threading.RLock()
-        self.condition = threading.Condition(self.lock)
-        self.last_progress: dict | None = None
-        self.progress_sequence = 0
-        self.terminal_result: dict | None = None
-
-    def ingest(self, payload: dict) -> None:
-        if payload.get("schema_version") != SINK_SCHEMA_VERSION:
-            raise CliError("Collector sink schema mismatch.")
-        with self.lock:
-            start_page = int(payload.get("start_page", 0))
-            end_page = int(payload.get("end_page", 0))
-            pages = int(payload.get("pages", 0))
-            scanned = int(payload.get("scanned", 0))
-            if (
-                start_page != self.checkpoint["next_page"]
-                or end_page < start_page
-                or pages != end_page - start_page + 1
-                or scanned < 0
-            ):
-                raise CliError("Collector returned a non-sequential cache chunk.")
-
-            rows = payload.get("rows") or []
-            matched_pids = payload.get("matched_pids") or []
-            unavailable = payload.get("favorite_unavailable") or []
-            if not isinstance(matched_pids, list) or not all(
-                isinstance(pid, str) and pid for pid in matched_pids
-            ):
-                raise CliError("Collector returned invalid matched PIDs.")
-            if len(rows) != scanned:
-                raise CliError("Collector cache row count does not match scanned count.")
-            row_pids = {str(row.get("pid", "")) for row in rows}
-            match_pids = {str(pid) for pid in matched_pids}
-            unavailable_pids = {str(row.get("pid", "")) for row in unavailable}
-            if len(match_pids) != len(matched_pids):
-                raise CliError("Collector returned duplicate matched PIDs.")
-            if "" in unavailable_pids or not unavailable_pids.issubset(row_pids):
-                raise CliError("Collector returned invalid unavailable favorite metadata.")
-            if "" in match_pids or not match_pids.issubset(row_pids):
-                raise CliError("Collector returned matches outside its cache rows.")
-            missing_favorite_pids = {
-                str(row.get("pid", "")) for row in rows if row.get("favorites") is None
-            }
-            if not unavailable_pids.issubset(missing_favorite_pids):
-                raise CliError("Collector marked a known favorite count as unavailable.")
-            if (
-                self.filter_spec.min_favorites is not None
-                and not missing_favorite_pids.issubset(unavailable_pids)
-            ):
-                raise CliError("Collector omitted favorite counts or availability metadata.")
-
-            report_start = self.checkpoint["start_timestamp"]
-            report_end = self.checkpoint["end_timestamp"]
-            validated_match_pids = []
-            rows_by_pid = {str(row.get("pid", "")): row for row in rows}
-            for pid in matched_pids:
-                post = rows_by_pid[str(pid)]
-                timestamp = int(post.get("timestamp", 0))
-                reply = int(post.get("reply", 0))
-                raw_favorites = post.get("favorites")
-                favorites = None if raw_favorites is None else int(raw_favorites)
-                normalized_pid = str(pid)
-                engagement_match = self.filter_spec.matches(reply, favorites)
-                if (
-                    not normalized_pid
-                    or not (report_start <= timestamp < report_end)
-                    or not engagement_match
-                ):
-                    raise CliError("Collector returned a post outside the requested filter.")
-                validated_match_pids.append(normalized_pid)
-
-            chunk_telemetry = empty_telemetry()
-            merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
-            cache_started = time.perf_counter()
-            with self.cache.transaction():
-                self.cache.record_favorite_unavailable(unavailable, commit=False)
-                self.cache.upsert_posts(rows, commit=False)
-            cache_write_ms = round((time.perf_counter() - cache_started) * 1000)
-            chunk_telemetry["cache_write_ms"] = cache_write_ms
-            merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            if missing_favorite_pids and self.filter_spec.min_favorites is None:
-                self.checkpoint["favorites_complete"] = False
-            for pid in validated_match_pids:
-                self.checkpoint["matched_by_pid"][pid] = True
-
-            self.checkpoint["next_page"] = end_page + 1
-            self.checkpoint["total_pages"] += pages
-            self.checkpoint["total_scanned"] += scanned
-            self.checkpoint["reached_start"] = bool(payload.get("reached_start"))
-            self.checkpoint["feed_exhausted"] = bool(payload.get("feed_exhausted"))
-            self.checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
-            self.last_progress = {
-                "page": end_page,
-                "pages": self.checkpoint["total_pages"],
-                "scanned": self.checkpoint["total_scanned"],
-                "matched": len(self.checkpoint["matched_by_pid"]),
-                "oldest": int(payload.get("oldest", 0)),
-            }
-            if payload.get("terminal"):
-                self.terminal_result = {
-                    "reached_start": bool(payload.get("reached_start")),
-                    "feed_exhausted": bool(payload.get("feed_exhausted")),
-                }
-            if payload.get("checkpoint") or payload.get("terminal"):
-                write_checkpoint(self.checkpoint_path, self.checkpoint)
-            self.progress_sequence += 1
-            self.condition.notify_all()
-
-    def flush(self) -> None:
-        with self.lock:
-            write_checkpoint(self.checkpoint_path, self.checkpoint)
-
-    def wait_for_progress(
-        self, after_sequence: int, process_done: threading.Event
-    ) -> tuple[int, dict | None]:
-        with self.condition:
-            self.condition.wait_for(
-                lambda: self.progress_sequence > after_sequence or process_done.is_set()
-            )
-            progress = dict(self.last_progress) if self.last_progress else None
-            return self.progress_sequence, progress
-
-    def wake_waiters(self) -> None:
-        with self.condition:
-            self.condition.notify_all()
-
-    def result(self) -> dict | None:
-        with self.lock:
-            return dict(self.terminal_result) if self.terminal_result else None
-
-
-class SinkServer:
-    def __init__(self, sink: RunSink):
-        token = secrets.token_urlsafe(24)
-        sink_ref = sink
-
-        class Handler(BaseHTTPRequestHandler):
-            def _cors(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", SITE_ORIGIN)
-                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "content-type")
-                self.send_header("Access-Control-Allow-Private-Network", "true")
-                self.send_header("Access-Control-Max-Age", "3600")
-
-            def do_OPTIONS(self) -> None:
-                self.send_response(204)
-                self._cors()
-                self.end_headers()
-
-            def do_POST(self) -> None:
-                parsed = urlparse(self.path)
-                supplied = parse_qs(parsed.query).get("token", [""])[0]
-                origin = self.headers.get("Origin", "")
-                if (
-                    parsed.path != "/ingest"
-                    or not hmac.compare_digest(supplied, token)
-                    or origin != SITE_ORIGIN
-                ):
-                    self.send_response(403)
-                    self._cors()
-                    self.end_headers()
-                    return
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    if length <= 0 or length > 64 * 1024 * 1024:
-                        raise CliError("Invalid local cache payload size.")
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                    sink_ref.ingest(payload)
-                    body = b'{"ok":true}'
-                    self.send_response(200)
-                except Exception as error:
-                    body = json.dumps(
-                        {"ok": False, "error": str(error)[:500]}, ensure_ascii=False
-                    ).encode("utf-8")
-                    self.send_response(500)
-                self._cors()
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, _format: str, *_args) -> None:
-                return
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        port = self.server.server_address[1]
-        self.url = f"http://127.0.0.1:{port}/ingest?{urlencode({'token': token})}"
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
 
 def report_profile(
     min_comments: int | None, min_favorites: int | None, match_mode: str
@@ -1114,6 +502,7 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
     cache = CacheStore(cache_path)
     try:
         checkpoint = None
+        completed_checkpoint = None
         if checkpoint_path.exists() and not args.fresh:
             candidate = load_checkpoint(checkpoint_path, spec)
             if not should_reuse_checkpoint(args, candidate):
@@ -1146,54 +535,49 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
                     )
                 checkpoint["cache_path"] = str(cache_path)
                 if checkpoint["completed"]:
-                    coverage = cache.find_covering(
-                        start_ts, end_ts, require_favorites=args.min_favorites is not None
+                    completed_checkpoint = checkpoint
+                else:
+                    print(
+                        f"恢复检查点：从 API 第 {checkpoint['next_page']} 页继续，"
+                        f"已累计 {checkpoint['total_pages']} 页 / "
+                        f"{checkpoint['total_scanned']:,} 条。",
+                        flush=True,
                     )
-                    report = ReportSpec.from_args(
-                        args, output, window_label, start_ts, end_ts
-                    )
-                    emit_cached_report(
-                        cache,
-                        report,
-                        coverage["completed_at"]
-                        if coverage
-                        else checkpoint.get("completed_at", checkpoint["updated_at"]),
-                        0 if coverage else checkpoint["total_pages"],
-                        0 if coverage else checkpoint["total_scanned"],
-                        bool(coverage),
-                        "reused_completed_checkpoint",
-                    )
-                    return
-                print(
-                    f"恢复检查点：从 API 第 {checkpoint['next_page']} 页继续，"
-                    f"已累计 {checkpoint['total_pages']} 页 / "
-                    f"{checkpoint['total_scanned']:,} 条。",
-                    flush=True,
-                )
 
-        if checkpoint is None:
-            covering = (
-                None
-                if args.fresh
-                else cache.find_covering(
-                    start_ts, end_ts, require_favorites=args.min_favorites is not None
-                )
+        covering = None
+        cache_marker = None
+        if completed_checkpoint:
+            covering = cache.find_covering(
+                start_ts, end_ts, require_favorites=args.min_favorites is not None
+            )
+            cache_marker = "reused_completed_checkpoint"
+        elif checkpoint is None and not args.fresh:
+            covering = cache.find_covering(
+                start_ts, end_ts, require_favorites=args.min_favorites is not None
             )
             if covering:
-                report = ReportSpec.from_args(
-                    args, output, window_label, start_ts, end_ts
-                )
-                emit_cached_report(
-                    cache,
-                    report,
-                    covering["completed_at"],
-                    0,
-                    0,
-                    True,
-                    "cache_hit",
-                )
-                return
+                cache_marker = "cache_hit"
 
+        if cache_marker:
+            report = ReportSpec.from_args(args, output, window_label, start_ts, end_ts)
+            emit_cached_report(
+                cache,
+                report,
+                (
+                    covering["completed_at"]
+                    if covering
+                    else completed_checkpoint.get(
+                        "completed_at", completed_checkpoint["updated_at"]
+                    )
+                ),
+                0 if covering else completed_checkpoint["total_pages"],
+                0 if covering else completed_checkpoint["total_scanned"],
+                bool(covering),
+                cache_marker,
+            )
+            return
+
+        if checkpoint is None:
             cache_base = (
                 None
                 if args.fresh
