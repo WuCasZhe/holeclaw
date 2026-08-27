@@ -19,9 +19,9 @@ async (page) => {
     page_size: pageSize = 500,
     max_pages: maxPages = 2000,
     pages_before: pagesBefore = 0,
-    checkpoint_pages: checkpointPages = 500,
+    checkpoint_pages: checkpointPages = 100,
     cache_chunk_pages: cacheChunkPages = 5,
-    request_concurrency: requestConcurrency = 2,
+    request_concurrency: requestConcurrency = 4,
     delay_min_ms: delayMinMs = 600,
     delay_max_ms: delayMaxMs = 2000,
     sink_url: sinkUrl,
@@ -264,26 +264,62 @@ async (page) => {
           return matchMode === 'any' ? conditions.some(Boolean) : conditions.every(Boolean);
         };
 
-        while (pages < maxPages && !reachedStart && !feedExhausted) {
-          const batchSize = Math.min(effectiveConcurrency, maxPages - pages);
-          const firstBatchPage = startPage + pages;
-          const pageNumbers = Array.from(
-            { length: batchSize },
-            (_value, index) => firstBatchPage + index,
-          );
-          const pageResults = await Promise.all(
-            pageNumbers.map(async (pageNumber) => {
-              await pacingSleep();
-              const listJson = await requestJson(
-                `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
-                `list page ${pageNumber}`,
-              );
-              return { pageNumber, posts: listJson?.data?.list || [] };
-            }),
-          );
+        const pageLimit = startPage + maxPages;
+        const maxBufferedPages = Math.max(requestConcurrency * 2, requestConcurrency);
+        const pageBuffer = new Map();
+        const inFlightPages = new Map();
+        let nextPageToFetch = startPage;
+        let stopScheduling = false;
 
-          for (let batchIndex = 0; batchIndex < pageResults.length; batchIndex += 1) {
-            const { pageNumber, posts } = pageResults[batchIndex];
+        const launchListPage = (pageNumber) => {
+          const tracked = (async () => {
+            await pacingSleep();
+            const listJson = await requestJson(
+              `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
+              `list page ${pageNumber}`,
+            );
+            return { pageNumber, posts: listJson?.data?.list || [] };
+          })()
+            .then(
+              (result) => pageBuffer.set(pageNumber, result),
+              (error) => pageBuffer.set(pageNumber, { pageNumber, error }),
+            )
+            .finally(() => inFlightPages.delete(pageNumber));
+          inFlightPages.set(pageNumber, tracked);
+        };
+
+        const fillListRequestSlots = () => {
+          while (
+            !stopScheduling &&
+            inFlightPages.size < effectiveConcurrency &&
+            nextPageToFetch < pageLimit &&
+            inFlightPages.size + pageBuffer.size < maxBufferedPages
+          ) {
+            const pageNumber = nextPageToFetch;
+            nextPageToFetch += 1;
+            launchListPage(pageNumber);
+          }
+        };
+
+        const takeListPageInOrder = async (pageNumber) => {
+          fillListRequestSlots();
+          while (!pageBuffer.has(pageNumber)) {
+            if (!inFlightPages.size) {
+              throw new Error(`No list request can provide page ${pageNumber}.`);
+            }
+            await Promise.race([...inFlightPages.values()]);
+            fillListRequestSlots();
+          }
+          const result = pageBuffer.get(pageNumber);
+          pageBuffer.delete(pageNumber);
+          fillListRequestSlots();
+          if (result.error) throw result.error;
+          return result;
+        };
+
+        while (pages < maxPages && !reachedStart && !feedExhausted) {
+            const pageNumber = startPage + pages;
+            const { posts } = await takeListPageInOrder(pageNumber);
             pages += 1;
             scanned += posts.length;
             chunkScanned += posts.length;
@@ -356,8 +392,13 @@ async (page) => {
             const oldest = Number(posts.at(-1)?.timestamp || 0);
             if (oldest && oldest < scanStartTimestamp) reachedStart = true;
             const terminal = reachedStart || feedExhausted || pages === maxPages;
-            if (terminal && batchIndex + 1 < pageResults.length) {
-              chunkTelemetry.overfetch_pages += pageResults.length - batchIndex - 1;
+            if (terminal) {
+              stopScheduling = true;
+              await Promise.all([...inFlightPages.values()]);
+              chunkTelemetry.overfetch_pages += Math.max(
+                0,
+                nextPageToFetch - (pageNumber + 1),
+              );
             }
             const checkpoint =
               (pagesBefore + pages) % checkpointPages === 0 || terminal;
@@ -393,7 +434,6 @@ async (page) => {
               chunkWallStartedAt = performance.now();
             }
             if (terminal) break;
-          }
         }
 
         return null;

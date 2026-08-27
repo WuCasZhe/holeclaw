@@ -27,7 +27,7 @@ HoleClaw 是一个树洞Claw，它按时间范围、评论数和收藏数阈值�
 | Node.js/npm | 通过 `npx` 启动 Playwright CLI |
 | Google Chrome / Edge | 浏览器自动化 |
 
-适用于 WSL2 环境
+适用于 Windows、Linux 和 WSL2。WSL 启动时会检查实际使用的 `npx`：如果它来自 Windows，入口自动切换到 Windows Python，并使用原生 `.cmd` 包装器；如果是 WSL 原生 Node，则所有进程留在 WSL。浏览器、localhost 回调和 SQLite 始终位于同一运行环境。
 ## 安装
 
 作为 Codex Skill 安装：
@@ -69,14 +69,14 @@ python3 scripts/run_digest.py standalone \
   --since 2026-08-01 --until 2026-08-07 \
   --min-comments 100 --min-favorites 50
 
-# 使用 1–4 的有限并发；默认值为 2
+# 使用 1–4 的滚动有限并发；默认值为 4
 python3 scripts/run_digest.py standalone \
   --days 7 --min-comments 100 --concurrency 4
 ```
 
 首次运行时，脚本会打开可视浏览器。完成统一身份认证后，脚本会保存本地登录状态并自动继续
 
-登录状态、SQLite 缓存和检查点默认相对于当前工作目录保存，可用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 指定固定路径。当前默认缓存为 `output/playwright/holeclaw-cache-v5.sqlite3`，检查点位于 `output/playwright/holeclaw-checkpoints-v4/`。全局参数需放在 `standalone` 之前，例如：
+登录状态默认相对于当前工作目录保存。SQLite 缓存和检查点默认保存在 `${HOLECLAW_RUNTIME_DIR}`，未设置时使用 `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`；该稳定位置会跨工作目录和筛选阈值复用完整覆盖。默认缓存为 `holeclaw-cache-v5.sqlite3`，检查点位于 `holeclaw-checkpoints-v4/`，默认每 100 页写入一次。可用全局 `--state` 和运行参数 `--cache` / `--checkpoint` / `--output` 覆盖路径。全局参数需放在 `standalone` 之前，例如：
 
 ```bash
 python3 scripts/run_digest.py \
@@ -84,4 +84,3 @@ python3 scripts/run_digest.py \
   standalone --days 1 --min-comments 100 \
   --cache /var/lib/holeclaw/cache.sqlite3
 ```
-

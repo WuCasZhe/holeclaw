@@ -54,9 +54,12 @@ class ThresholdTests(unittest.TestCase):
     def test_cache_chunks_default_to_one_page(self) -> None:
         self.assertEqual(self.parse_run().cache_chunk_pages, 1)
 
-    def test_request_concurrency_defaults_to_two_and_is_configurable(self) -> None:
-        self.assertEqual(self.parse_run().concurrency, 2)
-        self.assertEqual(self.parse_run("--concurrency", "4").concurrency, 4)
+    def test_request_concurrency_defaults_to_four_and_is_configurable(self) -> None:
+        self.assertEqual(self.parse_run().concurrency, 4)
+        self.assertEqual(self.parse_run("--concurrency", "1").concurrency, 1)
+
+    def test_checkpoint_interval_defaults_to_one_hundred_pages(self) -> None:
+        self.assertEqual(self.parse_run().checkpoint_pages, 100)
 
     def test_request_concurrency_rejects_values_above_safety_cap(self) -> None:
         args = self.parse_run("--concurrency", "5")
@@ -127,11 +130,38 @@ class ThresholdTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
     def test_default_runtime_paths_are_versioned(self) -> None:
-        self.assertEqual(
-            run_digest.default_cache_path().name, "holeclaw-cache-v5.sqlite3"
-        )
-        checkpoint = run_digest.default_checkpoint_path({"min_comments": 50})
-        self.assertEqual(checkpoint.parent.name, "holeclaw-checkpoints-v4")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                run_digest.os.environ,
+                {"HOLECLAW_RUNTIME_DIR": directory},
+            ):
+                runtime_root = Path(directory)
+                self.assertEqual(run_digest.default_runtime_root(), runtime_root)
+                self.assertEqual(
+                    run_digest.default_cache_path(),
+                    runtime_root / "holeclaw-cache-v5.sqlite3",
+                )
+                checkpoint = run_digest.default_checkpoint_path({"min_comments": 50})
+                self.assertEqual(checkpoint.parent.name, "holeclaw-checkpoints-v4")
+                self.assertEqual(checkpoint.parent.parent, runtime_root)
+
+    def test_default_runtime_paths_do_not_depend_on_working_directory(self) -> None:
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as runtime_directory:
+            with tempfile.TemporaryDirectory() as first_directory:
+                with tempfile.TemporaryDirectory() as second_directory:
+                    with patch.dict(
+                        run_digest.os.environ,
+                        {"HOLECLAW_RUNTIME_DIR": runtime_directory},
+                    ):
+                        try:
+                            run_digest.os.chdir(first_directory)
+                            first_cache = run_digest.default_cache_path()
+                            run_digest.os.chdir(second_directory)
+                            second_cache = run_digest.default_cache_path()
+                        finally:
+                            run_digest.os.chdir(original_cwd)
+        self.assertEqual(first_cache, second_cache)
 
 
 class StandaloneTests(unittest.TestCase):
@@ -149,9 +179,25 @@ class StandaloneTests(unittest.TestCase):
 
     def test_find_pwcli_prefers_bundled_wrapper(self) -> None:
         with patch.dict(run_digest.os.environ, {"PWCLI": ""}):
+            wrapper_name = (
+                "playwright_cli.cmd"
+                if run_digest.running_on_windows()
+                else "playwright_cli.sh"
+            )
             self.assertEqual(
                 run_digest.find_pwcli(),
-                MODULE_PATH.with_name("playwright_cli.sh"),
+                MODULE_PATH.with_name(wrapper_name),
+            )
+
+    def test_find_pwcli_uses_native_windows_wrapper(self) -> None:
+        with (
+            patch.dict(run_digest.os.environ, {"PWCLI": ""}),
+            patch.object(run_digest, "running_on_windows", return_value=True),
+            patch.object(run_digest.shutil, "which", return_value="npx.cmd"),
+        ):
+            self.assertEqual(
+                run_digest.find_pwcli(),
+                MODULE_PATH.with_name("playwright_cli.cmd"),
             )
 
     def test_non_interactive_browser_session_opens_headless(self) -> None:
@@ -167,6 +213,19 @@ class StandaloneTests(unittest.TestCase):
         ):
             browser.ensure_session()
         browser.run.assert_called_once_with("open", "about:blank")
+
+    def test_browser_cli_decodes_playwright_output_as_utf8(self) -> None:
+        completed = argparse.Namespace(stdout="北大树洞", stderr="", returncode=0)
+        with patch.object(
+            run_digest, "find_pwcli", return_value=Path("/tmp/playwright-cli")
+        ):
+            browser = run_digest.BrowserCli("utf8-session")
+        with patch.object(
+            run_digest.subprocess, "run", return_value=completed
+        ) as execute:
+            result = browser.run("snapshot")
+        self.assertEqual(result.stdout, "北大树洞")
+        self.assertEqual(execute.call_args.kwargs["encoding"], "utf-8")
 
     def test_non_interactive_mode_rejects_missing_login_state(self) -> None:
         events = []
@@ -226,6 +285,104 @@ class StandaloneTests(unittest.TestCase):
         digest.assert_called_once_with(args, standalone=True)
 
 
+class RuntimeRoutingTests(unittest.TestCase):
+    def test_windows_cli_arguments_convert_only_path_options(self) -> None:
+        converter = lambda value: f"WIN:{value}" if value.startswith("/") else value
+        with patch.object(run_digest, "windows_native_path", side_effect=converter):
+            converted = run_digest.windows_cli_arguments([
+                "--state", "/home/user/state.json",
+                "run",
+                "--cache=/mnt/c/cache.sqlite3",
+                "--output", "report.md",
+                "--days", "7",
+            ])
+        self.assertEqual(converted, [
+            "--state", "WIN:/home/user/state.json",
+            "run",
+            "--cache=WIN:/mnt/c/cache.sqlite3",
+            "--output", "report.md",
+            "--days", "7",
+        ])
+
+    def test_wsl_with_native_npx_stays_in_wsl(self) -> None:
+        with (
+            patch.object(run_digest, "is_wsl", return_value=True),
+            patch.object(run_digest, "playwright_npx_path", return_value="/usr/bin/npx"),
+            patch.object(run_digest.subprocess, "run") as execute,
+        ):
+            self.assertIsNone(run_digest.maybe_reexec_windows_runtime(["run"]))
+        execute.assert_not_called()
+
+    def test_wsl_with_windows_npx_reexecutes_windows_python(self) -> None:
+        completed = argparse.Namespace(returncode=7)
+        with (
+            patch.object(run_digest, "is_wsl", return_value=True),
+            patch.object(
+                run_digest,
+                "playwright_npx_path",
+                return_value="/mnt/c/Program Files/nodejs/npx",
+            ),
+            patch.object(
+                run_digest,
+                "windows_python_command",
+                return_value=["/mnt/c/Python/python.exe"],
+            ),
+            patch.object(
+                run_digest,
+                "windows_native_path",
+                side_effect=lambda value: f"WIN:{value}" if value.startswith("/") else value,
+            ),
+            patch.object(run_digest.subprocess, "run", return_value=completed) as execute,
+            patch.dict(
+                run_digest.os.environ,
+                {"PWCLI": "/tmp/pwcli", "PLAYWRIGHT_CLI_NPX": "/mnt/c/npx"},
+            ),
+        ):
+            result = run_digest.maybe_reexec_windows_runtime([
+                "--state", "/home/user/state.json", "run", "--days", "7"
+            ])
+
+        self.assertEqual(result, 7)
+        command = execute.call_args.args[0]
+        child_environment = execute.call_args.kwargs["env"]
+        self.assertEqual(command[0], "/mnt/c/Python/python.exe")
+        self.assertIn("WIN:/home/user/state.json", command)
+        self.assertEqual(child_environment["PYTHONUTF8"], "1")
+        self.assertNotIn("PWCLI", child_environment)
+        self.assertNotIn("PLAYWRIGHT_CLI_NPX", child_environment)
+
+    def test_windows_native_path_detection_does_not_treat_unc_cwd_as_wsl(self) -> None:
+        with (
+            patch.object(run_digest, "running_on_windows", return_value=True),
+            patch.dict(run_digest.os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}),
+        ):
+            self.assertFalse(run_digest.is_wsl())
+
+
+class ProcessInterruptionTests(unittest.TestCase):
+    def test_stop_collector_process_terminates_and_waits(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        with patch.object(run_digest.os, "name", "posix"):
+            run_digest.stop_collector_process(process, timeout=1)
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=1)
+        process.kill.assert_not_called()
+
+    def test_stop_collector_process_kills_after_timeout(self) -> None:
+        process = MagicMock()
+        process.poll.side_effect = [None, None]
+        process.wait.side_effect = [
+            run_digest.subprocess.TimeoutExpired("collector", 1),
+            0,
+        ]
+        with patch.object(run_digest.os, "name", "posix"):
+            run_digest.stop_collector_process(process, timeout=1)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_fresh_does_not_overwrite_explicit_legacy_checkpoint(self) -> None:
         args = run_digest.build_parser().parse_args([
@@ -247,6 +404,36 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(args.checkpoint.read_bytes(), before)
             self.assertFalse(args.cache.exists())
 
+    def test_keyboard_interrupt_flushes_resumable_checkpoint(self) -> None:
+        args = run_digest.build_parser().parse_args([
+            "standalone",
+            "--days", "1",
+            "--min-comments", "100",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args.cache = root / "cache.sqlite3"
+            args.checkpoint = root / "checkpoint.json"
+            args.output = root / "report.md"
+            server = MagicMock()
+            server.url = "http://127.0.0.1:12345/ingest?token=test"
+            with (
+                patch.object(run_digest, "ensure_standalone_login", return_value=MagicMock()),
+                patch.object(run_digest, "SinkServer", return_value=server),
+                patch.object(
+                    run_digest,
+                    "run_persistent_collector",
+                    side_effect=KeyboardInterrupt,
+                ),
+            ):
+                with self.assertRaisesRegex(run_digest.CliError, "检查点已保存"):
+                    run_digest.run_standalone(args)
+
+            checkpoint = run_digest.read_checkpoint(args.checkpoint)
+            self.assertEqual(checkpoint["next_page"], 1)
+            self.assertFalse(checkpoint["completed"])
+            server.close.assert_called_once_with()
+
     def test_new_default_paths_leave_legacy_runtime_files_untouched(self) -> None:
         original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as directory:
@@ -258,14 +445,21 @@ class WorkflowTests(unittest.TestCase):
             legacy_checkpoint = legacy_root / "holeclaw-checkpoints/legacy.json"
             legacy_checkpoint.parent.mkdir()
             legacy_checkpoint.write_bytes(b"legacy-checkpoint")
-            try:
-                run_digest.os.chdir(root)
-                new_cache = run_digest.default_cache_path()
-                new_checkpoint = run_digest.default_checkpoint_path({"min_comments": 50})
-                cache = run_digest.CacheStore(new_cache)
-                cache.close()
-            finally:
-                run_digest.os.chdir(original_cwd)
+            runtime_root = root / "stable-runtime"
+            with patch.dict(
+                run_digest.os.environ,
+                {"HOLECLAW_RUNTIME_DIR": str(runtime_root)},
+            ):
+                try:
+                    run_digest.os.chdir(root)
+                    new_cache = run_digest.default_cache_path()
+                    new_checkpoint = run_digest.default_checkpoint_path(
+                        {"min_comments": 50}
+                    )
+                    cache = run_digest.CacheStore(new_cache)
+                    cache.close()
+                finally:
+                    run_digest.os.chdir(original_cwd)
 
             self.assertEqual(legacy_cache.read_bytes(), b"legacy-cache")
             self.assertEqual(legacy_checkpoint.read_bytes(), b"legacy-checkpoint")

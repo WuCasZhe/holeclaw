@@ -45,15 +45,29 @@ def merge_telemetry(target: dict, update: dict) -> None:
             target[field] = int(target.get(field, 0)) + value
 
 
+def default_runtime_root() -> Path:
+    override = os.environ.get("HOLECLAW_RUNTIME_DIR")
+    if override:
+        return Path(override).expanduser()
+    codex_home = Path(
+        os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    ).expanduser()
+    return codex_home / "holeclaw-runtime"
+
+
 def default_checkpoint_path(spec: dict) -> Path:
     fingerprint = hashlib.sha256(
         json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
-    return Path.cwd() / "output/playwright/holeclaw-checkpoints-v4" / f"{fingerprint}.json"
+    return (
+        default_runtime_root()
+        / f"holeclaw-checkpoints-v{CHECKPOINT_SCHEMA_VERSION}"
+        / f"{fingerprint}.json"
+    )
 
 
 def default_cache_path() -> Path:
-    return Path.cwd() / f"output/playwright/holeclaw-cache-v{CACHE_SCHEMA_VERSION}.sqlite3"
+    return default_runtime_root() / f"holeclaw-cache-v{CACHE_SCHEMA_VERSION}.sqlite3"
 
 
 def write_checkpoint(path: Path, checkpoint: dict) -> None:

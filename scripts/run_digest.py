@@ -2,6 +2,8 @@
 import argparse
 import json
 import os
+import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -13,6 +15,7 @@ try:
     from holeclaw_checkpoint import (
         default_cache_path,
         default_checkpoint_path,
+        default_runtime_root,
         empty_telemetry,
         load_checkpoint,
         merge_telemetry,
@@ -38,6 +41,7 @@ except ModuleNotFoundError:
     from scripts.holeclaw_checkpoint import (
         default_cache_path,
         default_checkpoint_path,
+        default_runtime_root,
         empty_telemetry,
         load_checkpoint,
         merge_telemetry,
@@ -62,32 +66,147 @@ except ModuleNotFoundError:
 
 SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 CONFIG_KEY = "codex_pku_digest_config"
+PATH_ARGUMENTS = {"--state", "--cache", "--checkpoint", "--output"}
 
 
 def codex_base() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 
 
+def running_on_windows() -> bool:
+    return os.name == "nt"
+
+
+def is_wsl() -> bool:
+    return not running_on_windows() and bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
+def playwright_npx_path() -> str | None:
+    override = os.environ.get("PLAYWRIGHT_CLI_NPX")
+    if override:
+        return override
+    windows_npx = Path("/mnt/c/Program Files/nodejs/npx")
+    if is_wsl() and not shutil.which("google-chrome") and windows_npx.is_file():
+        return str(windows_npx)
+    return shutil.which("npx")
+
+
+def is_windows_mounted_path(path: str | None) -> bool:
+    if not path:
+        return False
+    normalized = str(Path(path).expanduser()).replace("\\", "/")
+    return normalized == "/mnt" or normalized.startswith("/mnt/")
+
+
+def windows_native_path(value: str) -> str:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return value
+    completed = subprocess.run(
+        ["wslpath", "-w", str(path.resolve())],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def windows_cli_arguments(arguments: list[str]) -> list[str]:
+    converted = []
+    expecting_path = False
+    for argument in arguments:
+        if expecting_path:
+            converted.append(windows_native_path(argument))
+            expecting_path = False
+            continue
+        matched_option = next(
+            (option for option in PATH_ARGUMENTS if argument.startswith(option + "=")),
+            None,
+        )
+        if matched_option:
+            _option, value = argument.split("=", 1)
+            converted.append(f"{matched_option}={windows_native_path(value)}")
+            continue
+        converted.append(argument)
+        expecting_path = argument in PATH_ARGUMENTS
+    return converted
+
+
+def windows_python_command() -> list[str] | None:
+    python = shutil.which("python.exe")
+    if python:
+        return [python]
+    launcher = shutil.which("py.exe")
+    return [launcher, "-3"] if launcher else None
+
+
+def maybe_reexec_windows_runtime(arguments: list[str] | None = None) -> int | None:
+    if not is_wsl() or not is_windows_mounted_path(playwright_npx_path()):
+        return None
+    python_command = windows_python_command()
+    if not python_command:
+        raise CliError(
+            "Playwright 将使用 Windows Node，但未找到 Windows Python。"
+            "请安装 Windows Python，或在 WSL 内安装原生 Node.js 和浏览器。"
+        )
+    child_environment = os.environ.copy()
+    child_environment["PYTHONUTF8"] = "1"
+    child_environment.pop("PWCLI", None)
+    child_environment.pop("PLAYWRIGHT_CLI_NPX", None)
+    codex_home = child_environment.get("CODEX_HOME")
+    if codex_home and not is_windows_mounted_path(codex_home):
+        child_environment.pop("CODEX_HOME", None)
+    runtime_root = child_environment.get("HOLECLAW_RUNTIME_DIR")
+    if runtime_root:
+        native_runtime = windows_native_path(runtime_root)
+        if native_runtime.startswith("\\\\wsl"):
+            raise CliError(
+                "Windows 采集运行时不能把 SQLite 放在 WSL 文件系统。"
+                "请取消 HOLECLAW_RUNTIME_DIR，或将其设置到 /mnt/c 下。"
+            )
+        child_environment["HOLECLAW_RUNTIME_DIR"] = native_runtime
+    child_arguments = windows_cli_arguments(
+        list(sys.argv[1:] if arguments is None else arguments)
+    )
+    command = [
+        *python_command,
+        windows_native_path(str(Path(__file__).resolve())),
+        *child_arguments,
+    ]
+    print(
+        "检测到 Windows Playwright 依赖；切换到 Windows Python，"
+        "确保浏览器、本地回调和 SQLite 位于同一运行环境。",
+        flush=True,
+    )
+    return subprocess.run(command, env=child_environment).returncode
+
+
 def find_pwcli() -> Path:
     override = os.environ.get("PWCLI")
-    local_wrapper = Path(__file__).with_name("playwright_cli.sh")
-    codex_wrapper = codex_base() / "skills/playwright/scripts/playwright_cli.sh"
+    wrapper_name = (
+        "playwright_cli.cmd" if running_on_windows() else "playwright_cli.sh"
+    )
+    local_wrapper = Path(__file__).with_name(wrapper_name)
+    codex_wrapper = codex_base() / "skills/playwright/scripts" / wrapper_name
     candidates = [Path(override)] if override else [local_wrapper, codex_wrapper]
     path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:
         checked = ", ".join(str(candidate) for candidate in candidates)
         raise CliError(f"Playwright wrapper not found. Checked: {checked}")
-    if subprocess.run(["bash", "-lc", "command -v npx >/dev/null 2>&1"]).returncode != 0:
+    npx = (
+        shutil.which("npx.cmd") or shutil.which("npx")
+        if running_on_windows()
+        else playwright_npx_path()
+    )
+    if not npx:
         raise CliError("npx is required. Install Node.js/npm first.")
     return path
 
 
 def native_path(path: Path) -> str:
-    if Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists():
-        completed = subprocess.run(
-            ["wslpath", "-w", str(path.resolve())], text=True, capture_output=True, check=True
-        )
-        return completed.stdout.strip()
+    if is_wsl():
+        return windows_native_path(str(path))
     return str(path.resolve())
 
 
@@ -102,7 +221,13 @@ class BrowserCli:
         if raw:
             command.append("--raw")
         command.extend(args)
-        completed = subprocess.run(command, text=True, capture_output=True, errors="replace")
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            errors="replace",
+        )
         if check and completed.returncode != 0:
             message = (completed.stdout + "\n" + completed.stderr).strip()
             raise CliError(message[-3000:])
@@ -110,7 +235,11 @@ class BrowserCli:
 
     def ensure_session(self) -> None:
         listing = subprocess.run(
-            [str(self.pwcli), "list"], text=True, capture_output=True, errors="replace"
+            [str(self.pwcli), "list"],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            errors="replace",
         )
         if self.session not in listing.stdout:
             arguments = ["open", "about:blank"]
@@ -373,6 +502,21 @@ def run_standalone(args: argparse.Namespace) -> None:
     run_digest(args, standalone=True)
 
 
+def stop_collector_process(process: subprocess.Popen, timeout: float = 5) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
+        process.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=timeout)
+
+
 def run_persistent_collector(
     browser: BrowserCli,
     args: argparse.Namespace,
@@ -413,12 +557,18 @@ def run_persistent_collector(
         "--filename",
         native_path(collector),
     ]
+    process_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
     process = subprocess.Popen(
         command,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         errors="replace",
+        **process_options,
     )
     process_done = threading.Event()
     process_output: dict[str, str] = {}
@@ -435,26 +585,31 @@ def run_persistent_collector(
     progress_sequence = 0
     last_reported_pages = checkpoint["total_pages"]
     progress_step = max(25, args.cache_chunk_pages)
-    while True:
-        progress_sequence, progress = sink.wait_for_progress(
-            progress_sequence, process_done
-        )
-        if progress and progress["pages"] - last_reported_pages >= progress_step:
-            oldest = progress.get("oldest", 0)
-            oldest_label = ""
-            if oldest:
-                oldest_label = f" / 最旧 {datetime.fromtimestamp(oldest, SHANGHAI):%Y-%m-%d %H:%M}"
-            print(
-                f"进度：API 第 {progress['page']} 页"
-                f" / 累计 {progress['pages']} 页"
-                f" / {progress['scanned']:,} 条"
-                f" / 本次命中 {progress['matched']} 条"
-                f"{oldest_label}",
-                flush=True,
+    try:
+        while True:
+            progress_sequence, progress = sink.wait_for_progress(
+                progress_sequence, process_done
             )
-            last_reported_pages = progress["pages"]
-        if process_done.is_set():
-            break
+            if progress and progress["pages"] - last_reported_pages >= progress_step:
+                oldest = progress.get("oldest", 0)
+                oldest_label = ""
+                if oldest:
+                    oldest_label = f" / 最旧 {datetime.fromtimestamp(oldest, SHANGHAI):%Y-%m-%d %H:%M}"
+                print(
+                    f"进度：API 第 {progress['page']} 页"
+                    f" / 累计 {progress['pages']} 页"
+                    f" / {progress['scanned']:,} 条"
+                    f" / 本次命中 {progress['matched']} 条"
+                    f"{oldest_label}",
+                    flush=True,
+                )
+                last_reported_pages = progress["pages"]
+            if process_done.is_set():
+                break
+    except KeyboardInterrupt:
+        stop_collector_process(process)
+        output_thread.join(timeout=10)
+        raise
 
     output_thread.join()
     stdout = process_output.get("stdout", "")
@@ -638,6 +793,13 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         server = SinkServer(sink)
         try:
             result = run_persistent_collector(browser, args, checkpoint, sink, server.url)
+        except KeyboardInterrupt as error:
+            sink.flush()
+            raise CliError(
+                "采集已中断，最新检查点已保存："
+                f"{checkpoint_path}；重新运行相同命令将从 API 第 "
+                f"{checkpoint['next_page']} 页继续。"
+            ) from error
         except Exception:
             sink.flush()
             raise
@@ -711,13 +873,13 @@ def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
         default="all",
         help="Require all thresholds (AND) or any threshold (OR)",
     )
-    parser.add_argument("--checkpoint-pages", type=int, default=500)
+    parser.add_argument("--checkpoint-pages", type=int, default=100)
     parser.add_argument("--cache-chunk-pages", type=int, default=1)
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=2,
-        help="Bounded Treehole request concurrency (1-4; default: 2)",
+        default=4,
+        help="Bounded Treehole request concurrency (1-4; default: 4)",
     )
     parser.add_argument("--max-total-pages", type=int, default=2000)
     parser.add_argument("--checkpoint", type=Path)
@@ -749,8 +911,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
     try:
+        reexec_code = maybe_reexec_windows_runtime()
+        if reexec_code is not None:
+            raise SystemExit(reexec_code)
+        args = build_parser().parse_args()
         if args.command == "login-open":
             login_open(args)
         elif args.command == "login-save":
@@ -762,6 +927,9 @@ def main() -> None:
     except CliError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         raise SystemExit(2)
+    except KeyboardInterrupt:
+        print("ERROR: 已中断。", file=sys.stderr)
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":
