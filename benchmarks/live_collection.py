@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import run_digest as runtime
 from scripts.holeclaw_archive import run_archive
+from scripts.holeclaw_runner import CollectorServices
 
 
 def main():
@@ -44,6 +45,7 @@ def main():
     if options.mode == 'archive':
         arguments.extend(['--account', 'performance-benchmark', '--source-cache', str(source)])
     timings = {}
+    measured_services = {}
     for name in ['ensure_standalone_login', 'run_persistent_collector']:
         original = getattr(runtime, name)
         def measured(*args, _name=name, _original=original, **kwargs):
@@ -52,7 +54,8 @@ def main():
                 return _original(*args, **kwargs)
             finally:
                 timings[_name + '_seconds'] = round(time.perf_counter() - started, 3)
-        setattr(runtime, name, measured)
+        measured_services[name] = measured
+    services = CollectorServices(**measured_services)
     args = runtime.build_parser().parse_args(arguments)
     result = dict(mode=options.mode, concurrency=options.concurrency,
                   page_limit=options.pages, directory=str(directory), session=session,
@@ -62,9 +65,9 @@ def main():
     started = time.perf_counter()
     try:
         if options.mode == 'archive':
-            run_archive(args, runtime)
+            run_archive(args, services)
         else:
-            runtime.run_standalone(args)
+            runtime.run_standalone(args, services)
     except runtime.CliError as error:
         result['collector_message'] = str(error)
     finally:

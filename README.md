@@ -39,3 +39,5 @@ git clone https://github.com/WuCasZhe/holeclaw.git
 cd holeclaw
 python3 scripts/run_digest.py standalone --help
 ```
+
+代码维护说明见 [模块职责、回调协议与测试](references/architecture.md)。

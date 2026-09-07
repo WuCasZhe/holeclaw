@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const {createHash} = require('node:crypto');
+const {unpackSinkMessage} = require('../tests/sink_protocol_fixture');
 const original = fs.readFileSync(path.join(__dirname, '../scripts/collect.js'), 'utf8');
 
 async function simulate(name, options = {}) {
@@ -47,7 +48,7 @@ async function simulate(name, options = {}) {
   const fetch = async (url, request = {}) => {
     if (url.startsWith(config.sink_url)) {
       counts.sink++;
-      const payload = JSON.parse(request.body);
+      const payload = unpackSinkMessage(JSON.parse(request.body));
       await delay(sinkMs);
       if (payload.archive_prepare) return response({ok: true, resumes:
         Object.fromEntries(payload.posts.map(post => [post.pid, {next_page: 1, complete: false}]))});

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import run_digest as runtime
+from scripts.holeclaw_runner import CollectorServices
 from scripts.holeclaw_archive import ArchiveStore, ArchiveSink, run_archive, search_archive
 from scripts.holeclaw_cache import CacheStore
 from scripts.holeclaw_domain import CliError
@@ -91,14 +92,14 @@ class ArchiveTests(unittest.TestCase):
             raise CliError('network interruption')
         with patch.object(runtime, 'ensure_standalone_login'), patch.object(runtime, 'run_persistent_collector', side_effect=interrupted):
             with self.assertRaisesRegex(CliError, 'network interruption'):
-                run_archive(args, runtime)
+                run_archive(args, CollectorServices(runtime.ensure_standalone_login, runtime.run_persistent_collector))
         def resumed(browser, args, checkpoint, sink, url):
             self.assertEqual(checkpoint['next_page'], 2)
             return dict(reached_start=True, feed_exhausted=False)
         with patch.object(runtime, 'ensure_standalone_login'), patch.object(runtime, 'run_persistent_collector', side_effect=resumed):
-            run_archive(args, runtime)
+            run_archive(args, CollectorServices(runtime.ensure_standalone_login, runtime.run_persistent_collector))
         with patch.object(runtime, 'ensure_standalone_login', side_effect=AssertionError('should use completed archive')):
-            run_archive(args, runtime)
+            run_archive(args, CollectorServices(runtime.ensure_standalone_login, runtime.run_persistent_collector))
 
     def test_filtered_archive_keeps_unmatched_rows_only_in_source_cache(self):
         source = CacheStore(Path(self.temp.name) / 'source.sqlite3')
@@ -132,7 +133,7 @@ class ArchiveTests(unittest.TestCase):
     def test_interrupted_transaction_rolls_back(self):
         with self.assertRaises(KeyboardInterrupt):
             with self.store.transaction():
-                self.store.upsert_posts([self.post], commit=False)
+                self.store.upsert_posts([self.post])
                 raise KeyboardInterrupt()
         self.assertEqual(self.store.post_count(), 0)
 
@@ -166,7 +167,7 @@ class ArchiveTests(unittest.TestCase):
         source.close()
         self.store.ingest_comments(dict(self.payload, post=post, complete=True))
         with patch.object(runtime, 'ensure_standalone_login', side_effect=AssertionError('browser unnecessary')):
-            run_archive(args, runtime)
+            run_archive(args, CollectorServices(runtime.ensure_standalone_login, runtime.run_persistent_collector))
         checkpoint = runtime.read_checkpoint(args.checkpoint)
         self.assertTrue(checkpoint['completed'])
         self.assertEqual(checkpoint['cached_posts'], 1)
@@ -174,18 +175,18 @@ class ArchiveTests(unittest.TestCase):
 
     def test_progress_is_time_limited_and_cancel_rejects_writes(self):
         checkpoint = runtime.new_checkpoint({}, 100, 200, 100, 'test')
-        with patch('scripts.holeclaw_archive.time.monotonic', return_value=0):
+        with patch('scripts.holeclaw_archive_sink.time.monotonic', return_value=0):
             sink = ArchiveSink(self.store, checkpoint, Path(self.temp.name) / 'cp.json', None, None,
                                progress_seconds=120)
         payload = dict(self.payload, schema_version=2, archive_comments=True, archive_run=checkpoint['created_at'])
         output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch('scripts.holeclaw_archive.time.monotonic', return_value=119):
-            for _ in range(30):
-                sink.ingest(payload)
+        with contextlib.redirect_stdout(output), patch('scripts.holeclaw_archive_sink.time.monotonic', return_value=119):
+            for page in range(1, 31):
+                sink.ingest(dict(payload, comment_page=page))
         self.assertEqual(output.getvalue(), '')
-        with contextlib.redirect_stdout(output), patch('scripts.holeclaw_archive.time.monotonic', return_value=120):
-            sink.ingest(payload)
-            sink.ingest(payload)
+        with contextlib.redirect_stdout(output), patch('scripts.holeclaw_archive_sink.time.monotonic', return_value=120):
+            sink.ingest(dict(payload, comment_page=31))
+            sink.ingest(dict(payload, comment_page=32))
         self.assertEqual(output.getvalue().count('档案阶段进度'), 1)
         self.assertIn('帖子最后日期（最旧）：1970-01-01 08:02', output.getvalue())
         sink.cancel()

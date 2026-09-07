@@ -1,13 +1,13 @@
 import secrets
 import sqlite3
-import threading
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 try:
+    from holeclaw_database import DatabaseSession
     from holeclaw_domain import CACHE_SCHEMA_VERSION, CliError, FilterSpec, SHANGHAI
 except ModuleNotFoundError:
+    from scripts.holeclaw_database import DatabaseSession
     from scripts.holeclaw_domain import (
         CACHE_SCHEMA_VERSION,
         CliError,
@@ -25,7 +25,7 @@ class CacheStore:
         if self.path.exists():
             try:
                 inspection = sqlite3.connect(
-                    f"file:{self.path}?mode=ro", uri=True, timeout=5
+                    f"{self.path.as_uri()}?mode=ro", uri=True, timeout=5
                 )
                 try:
                     schema_row = inspection.execute(
@@ -48,15 +48,10 @@ class CacheStore:
                     f"Cache schema v{schema_version} is incompatible with schema "
                     f"v{CACHE_SCHEMA_VERSION}: {self.path}. Use a new cache path."
                 )
-        self.lock = threading.RLock()
-        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30, uri=True)
-        self.connection.row_factory = sqlite3.Row
-        # Enter Python periodically during long SQLite work so Ctrl+C is delivered.
-        self.connection.set_progress_handler(lambda: 0, 1000)
-        with self.lock:
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=NORMAL")
-            self.connection.execute("PRAGMA temp_store=MEMORY")
+        self.database = DatabaseSession(self.path)
+        self.lock = self.database.lock
+        self.connection = self.database.connection
+        with self.transaction():
             self.connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -123,28 +118,22 @@ class CacheStore:
                     "INSERT INTO metadata(key, value) VALUES('instance_id', ?)",
                     (self.instance_id,),
                 )
-            self.connection.commit()
         self.path.chmod(0o600)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def close(self) -> None:
-        with self.lock:
-            self.connection.commit()
-            self.connection.close()
+        self.database.close()
         self.path.chmod(0o600)
 
-    @contextmanager
     def transaction(self):
-        """Serialize a cache chunk and commit it as one SQLite transaction."""
-        with self.lock:
-            try:
-                yield
-            except BaseException:
-                self.connection.rollback()
-                raise
-            else:
-                self.connection.commit()
+        return self.database.transaction()
 
-    def upsert_posts(self, rows: list[dict], *, commit: bool = True) -> None:
+    def upsert_posts(self, rows: list[dict]) -> None:
         if not rows:
             return
         observed_at = int(datetime.now(SHANGHAI).timestamp())
@@ -173,7 +162,7 @@ class CacheStore:
                     observed_at,
                 )
             )
-        with self.lock:
+        with self.transaction():
             self.connection.executemany(
                 """
                 INSERT INTO posts(
@@ -206,11 +195,8 @@ class CacheStore:
                     """,
                     ((pid, pid) for pid in input_pids),
                 )
-            if commit:
-                self.connection.commit()
-
     def record_favorite_unavailable(
-        self, rows: list[dict], *, commit: bool = True
+        self, rows: list[dict]
     ) -> None:
         if not rows:
             return
@@ -222,7 +208,7 @@ class CacheStore:
             if not pid:
                 raise CliError("Collector returned an invalid unavailable favorite PID.")
             values.append((pid, observed_at, reason[:120]))
-        with self.lock:
+        with self.transaction():
             self.connection.executemany(
                 """
                 INSERT INTO favorite_unavailable(pid, observed_at, reason)
@@ -233,9 +219,6 @@ class CacheStore:
                 """,
                 values,
             )
-            if commit:
-                self.connection.commit()
-
     def query_posts(
         self,
         start_ts: int,
@@ -320,7 +303,7 @@ class CacheStore:
         scanned: int,
         favorites_complete: bool,
     ) -> None:
-        with self.lock:
+        with self.transaction():
             self.connection.execute(
                 """
                 INSERT INTO coverage(
@@ -330,7 +313,6 @@ class CacheStore:
                 """,
                 (start_ts, end_ts, completed_at, pages, scanned, int(favorites_complete)),
             )
-            self.connection.commit()
 
     def integrity_check(self) -> str:
         with self.lock:

@@ -134,188 +134,198 @@ async (page) => {
           signal.addEventListener('abort', abort, { once: true });
           timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, milliseconds);
         });
-        const jitter = () =>
-          delayMinMs + Math.floor(Math.random() * (delayMaxMs - delayMinMs + 1));
-        const newTelemetry = () => ({
-          list_requests: 0,
-          detail_requests: 0,
-          comment_requests: 0,
-          image_requests: 0,
-          image_bytes: 0,
-          request_ms: 0,
-          pacing_ms: 0,
-          retry_backoff_ms: 0,
-          response_chars: 0,
-          wall_ms: 0,
-          throttle_responses: 0,
-          concurrency_reductions: 0,
-          max_in_flight: 0,
-          overfetch_pages: 0,
-        });
-        const chunkTelemetry = newTelemetry();
-        let reportedTelemetry = newTelemetry();
-        const wallStartedAt = performance.now();
-        const telemetrySnapshot = () => ({...chunkTelemetry,
-          wall_ms: Math.max(0, Math.round(performance.now() - wallStartedAt))});
-        const telemetryDelta = (snapshot) => Object.fromEntries(Object.entries(snapshot)
-          .map(([key, value]) => [key, key === 'max_in_flight' ? value : value - reportedTelemetry[key]]));
-        let activeRequests = 0;
-        let cooldownUntil = 0;
-        let effectiveConcurrency = requestConcurrency;
-
-        const pacingSleep = async () => {
-          const milliseconds = jitter();
-          chunkTelemetry.pacing_ms += milliseconds;
-          await sleep(milliseconds);
+        const createTelemetry = (now) => {
+          const empty = () => ({
+            list_requests: 0,
+            detail_requests: 0,
+            comment_requests: 0,
+            image_requests: 0,
+            image_bytes: 0,
+            request_ms: 0,
+            pacing_ms: 0,
+            retry_backoff_ms: 0,
+            response_chars: 0,
+            wall_ms: 0,
+            throttle_responses: 0,
+            concurrency_reductions: 0,
+            max_in_flight: 0,
+            overfetch_pages: 0,
+          });
+          const counters = empty();
+          let reported = empty();
+          const startedAt = now();
+          return {
+            add(key, value = 1) { counters[key] += value; },
+            observeMax(key, value) { counters[key] = Math.max(counters[key], value); },
+            snapshot: () => ({...counters, wall_ms: Math.max(0, Math.round(now() - startedAt))}),
+            delta: (snapshot) => Object.fromEntries(Object.entries(snapshot).map(([key, value]) =>
+              [key, key === 'max_in_flight' ? value : value - reported[key]])),
+            acknowledge(snapshot) { reported = snapshot; },
+          };
         };
+        const telemetry = createTelemetry(() => performance.now());
+        const createRequestScheduler = ({fetch, sleep, clock, random, signal, telemetry}) => {
+          let activeRequests = 0;
+          let cooldownUntil = 0;
+          let effectiveConcurrency = requestConcurrency;
 
-        const waitForSharedCooldown = async () => {
-          while (cooldownUntil > Date.now()) {
-            const milliseconds = cooldownUntil - Date.now();
-            chunkTelemetry.retry_backoff_ms += milliseconds;
+          const pacingSleep = async () => {
+            const milliseconds = delayMinMs + Math.floor(random() * (delayMaxMs - delayMinMs + 1));
+            telemetry.add('pacing_ms', milliseconds);
             await sleep(milliseconds);
-          }
-        };
+          };
 
-        const retryAfterMilliseconds = (rawValue) => {
-          if (!rawValue) return 0;
-          const seconds = Number(rawValue);
-          if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-          const retryAt = Date.parse(rawValue);
-          return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : 0;
-        };
+          const waitForSharedCooldown = async () => {
+            while (cooldownUntil > clock.now()) {
+              const milliseconds = cooldownUntil - clock.now();
+              telemetry.add('retry_backoff_ms', milliseconds);
+              await sleep(milliseconds);
+            }
+          };
 
-        // Share permits across list prefetch, detail workers and retries.
-        let occupiedSlots = 0;
-        const requestWaiters = [];
-        controller.signal.addEventListener('abort', () => {
-          while (requestWaiters.length) requestWaiters.shift()();
-        });
-        const grantRequestSlots = () => {
-          while (requestWaiters.length && occupiedSlots < effectiveConcurrency) {
-            occupiedSlots += 1;
-            requestWaiters.shift()();
-          }
-        };
-        const acquireRequestSlot = async () => {
-          while (true) {
-            controller.signal.throwIfAborted();
-            await waitForSharedCooldown();
-            await new Promise((resolve) => {
-              requestWaiters.push(resolve);
-              grantRequestSlots();
-            });
-            controller.signal.throwIfAborted();
-            // A throttle may arrive while queued. Do not hold a stale permit
-            // through its cooldown and then exceed the reduced concurrency.
-            if (cooldownUntil <= Date.now() && occupiedSlots <= effectiveConcurrency) return;
-            releaseRequestSlot();
-          }
-        };
-        const releaseRequestSlot = () => {
-          occupiedSlots -= 1;
-          grantRequestSlots();
-        };
+          const retryAfterMilliseconds = (rawValue) => {
+            if (!rawValue) return 0;
+            const seconds = Number(rawValue);
+            if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+            const retryAt = Date.parse(rawValue);
+            return Number.isFinite(retryAt) ? Math.max(0, retryAt - clock.now()) : 0;
+          };
 
-        const requestJson = async (url, label, binary = false, allowMissing = false) => {
-          let result = null;
-          for (let attempt = 0; attempt < 3; attempt += 1) {
-            await acquireRequestSlot();
-            try {
-              const startedAt = performance.now();
-              const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
-              chunkTelemetry[requestCounter] += 1;
-              if (binary) chunkTelemetry.image_requests += 1;
-              if (label.startsWith('detail comments ')) chunkTelemetry.comment_requests += 1;
-              activeRequests += 1;
-              chunkTelemetry.max_in_flight = Math.max(
-                chunkTelemetry.max_in_flight,
-                activeRequests,
-              );
-              try {
-                const response = await fetch(url, { headers: authHeaders, signal: controller.signal });
-                if (binary && response.status === 200 && !response.headers.get('content-type')?.includes('json')) {
-                  const reader = response.body.getReader();
-                  const chunks = [];
-                  let size = 0;
-                  while (true) {
-                    controller.signal.throwIfAborted();
-                    const {value, done} = await reader.read();
-                    if (done) break;
-                    size += value.length;
-                    if (size > 20 * 1024 * 1024) {
-                      await reader.cancel();
-                      throw Object.assign(new Error('Image exceeds the 20 MiB limit.'), {permanent: true});
-                    }
-                    chunks.push(value);
-                  }
-                  let raw = '';
-                  for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 8192) {
-                    raw += String.fromCharCode(...chunk.subarray(i, i + 8192));
-                  }
-                  chunkTelemetry.image_bytes += size;
-                  result = {status: 200, file: {data: btoa(raw), mime: response.headers.get('content-type') || ''}};
-                } else {
-                const text = await response.text();
-                chunkTelemetry.response_chars += text.length;
-                let json = null;
-                try {
-                  json = JSON.parse(text);
-                } catch {
-                  // Report a short preview only; never expose request headers.
-                }
-                result = {
-                  status: response.status,
-                  retryAfter: response.headers.get('retry-after'),
-                  json,
-                  preview: json ? '' : text.slice(0, 80),
-                };
-                }
-              } catch (error) {
-                controller.signal.throwIfAborted();
-                if (error.permanent) throw error;
-                result = {
-                  status: 0,
-                  retryAfter: null,
-                  json: null,
-                  preview: error?.name || 'NetworkError',
-                };
-              } finally {
-                activeRequests -= 1;
-                chunkTelemetry.request_ms += Math.max(0, Math.round(performance.now() - startedAt));
-              }
-
-              const transient =
-                result.status === 0 || result.status === 429 || result.status >= 500;
-              if (result.status === 429) {
-                chunkTelemetry.throttle_responses += 1;
-                if (effectiveConcurrency > 1) {
-                  effectiveConcurrency -= 1;
-                  chunkTelemetry.concurrency_reductions += 1;
-                }
-              }
-              if (!transient || attempt === 2) break;
-              const serverDelay = retryAfterMilliseconds(result.retryAfter);
-              const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
-              const backoffMilliseconds = Math.min(60_000, backoff);
-              cooldownUntil = Math.max(cooldownUntil, Date.now() + backoffMilliseconds);
-            } finally {
+          // Share permits across list prefetch, detail workers and retries.
+          let occupiedSlots = 0;
+          const requestWaiters = [];
+          signal.addEventListener('abort', () => {
+            while (requestWaiters.length) requestWaiters.shift()();
+          });
+          const grantRequestSlots = () => {
+            while (requestWaiters.length && occupiedSlots < effectiveConcurrency) {
+              occupiedSlots += 1;
+              requestWaiters.shift()();
+            }
+          };
+          const acquireRequestSlot = async () => {
+            while (true) {
+              signal.throwIfAborted();
+              await waitForSharedCooldown();
+              await new Promise((resolve) => {
+                requestWaiters.push(resolve);
+                grantRequestSlots();
+              });
+              signal.throwIfAborted();
+              // A throttle may arrive while queued. Do not hold a stale permit
+              // through its cooldown and then exceed the reduced concurrency.
+              if (cooldownUntil <= clock.now() && occupiedSlots <= effectiveConcurrency) return;
               releaseRequestSlot();
             }
-          }
-          if (result.status === 401 || result.status === 403) {
-            throw new Error(`Authentication expired while loading ${label} (${result.status}).`);
-          }
-          if (allowMissing && (result.json?.code === 41001 || [404, 410].includes(result.status))) return {unavailable: true};
-          if (binary && ([404, 410].includes(result.status) || result.json?.code === 41001)) return {status: 'unavailable'};
-          if (binary && result.file) return result.file;
-          if (binary || result.status !== 200 || result.json?.code !== 20000) {
-            throw new Error(
-              `${label} failed: HTTP ${result.status}, code ${result.json?.code}, ${result.preview}`,
-            );
-          }
-          return result.json;
+          };
+          const releaseRequestSlot = () => {
+            occupiedSlots -= 1;
+            grantRequestSlots();
+          };
+
+          const requestJson = async (url, label, binary = false, allowMissing = false) => {
+            let result = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              await acquireRequestSlot();
+              try {
+                const startedAt = clock.monotonic();
+                const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
+                telemetry.add(requestCounter);
+                if (binary) telemetry.add('image_requests', 1);
+                if (label.startsWith('detail comments ')) telemetry.add('comment_requests', 1);
+                activeRequests += 1;
+                telemetry.observeMax('max_in_flight', activeRequests);
+                try {
+                  const response = await fetch(url, { headers: authHeaders, signal: signal });
+                  if (binary && response.status === 200 && !response.headers.get('content-type')?.includes('json')) {
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let size = 0;
+                    while (true) {
+                      signal.throwIfAborted();
+                      const {value, done} = await reader.read();
+                      if (done) break;
+                      size += value.length;
+                      if (size > 20 * 1024 * 1024) {
+                        await reader.cancel();
+                        throw Object.assign(new Error('Image exceeds the 20 MiB limit.'), {permanent: true});
+                      }
+                      chunks.push(value);
+                    }
+                    let raw = '';
+                    for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 8192) {
+                      raw += String.fromCharCode(...chunk.subarray(i, i + 8192));
+                    }
+                    telemetry.add('image_bytes', size);
+                    result = {status: 200, file: {data: btoa(raw), mime: response.headers.get('content-type') || ''}};
+                  } else {
+                  const text = await response.text();
+                  telemetry.add('response_chars', text.length);
+                  let json = null;
+                  try {
+                    json = JSON.parse(text);
+                  } catch {
+                    // Report a short preview only; never expose request headers.
+                  }
+                  result = {
+                    status: response.status,
+                    retryAfter: response.headers.get('retry-after'),
+                    json,
+                    preview: json ? '' : text.slice(0, 80),
+                  };
+                  }
+                } catch (error) {
+                  signal.throwIfAborted();
+                  if (error.permanent) throw error;
+                  result = {
+                    status: 0,
+                    retryAfter: null,
+                    json: null,
+                    preview: error?.name || 'NetworkError',
+                  };
+                } finally {
+                  activeRequests -= 1;
+                  telemetry.add('request_ms', Math.max(0, Math.round(clock.monotonic() - startedAt)));
+                }
+
+                const transient =
+                  result.status === 0 || result.status === 429 || result.status >= 500;
+                if (result.status === 429) {
+                  telemetry.add('throttle_responses', 1);
+                  if (effectiveConcurrency > 1) {
+                    effectiveConcurrency -= 1;
+                    telemetry.add('concurrency_reductions', 1);
+                  }
+                }
+                if (!transient || attempt === 2) break;
+                const serverDelay = retryAfterMilliseconds(result.retryAfter);
+                const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
+                const backoffMilliseconds = Math.min(60_000, backoff);
+                cooldownUntil = Math.max(cooldownUntil, clock.now() + backoffMilliseconds);
+              } finally {
+                releaseRequestSlot();
+              }
+            }
+            if (result.status === 401 || result.status === 403) {
+              throw new Error(`Authentication expired while loading ${label} (${result.status}).`);
+            }
+            if (allowMissing && (result.json?.code === 41001 || [404, 410].includes(result.status))) return {unavailable: true};
+            if (binary && ([404, 410].includes(result.status) || result.json?.code === 41001)) return {status: 'unavailable'};
+            if (binary && result.file) return result.file;
+            if (binary || result.status !== 200 || result.json?.code !== 20000) {
+              throw new Error(
+                `${label} failed: HTTP ${result.status}, code ${result.json?.code}, ${result.preview}`,
+              );
+            }
+            return result.json;
+          };
+
+          return {request: requestJson, pace: pacingSleep, get concurrency() { return effectiveConcurrency; }};
         };
+        const scheduler = createRequestScheduler({fetch, sleep, telemetry, signal: controller.signal,
+          clock: {now: () => Date.now(), monotonic: () => performance.now()}, random: () => Math.random()});
+        const requestJson = scheduler.request;
+        const pacingSleep = scheduler.pace;
 
         const mapLimit = async (items, limit, worker) => {
           let nextIndex = 0;
@@ -340,28 +350,36 @@ async (page) => {
           return Number.isInteger(value) && value >= 0 ? value : fallback;
         };
 
-        const sendToSink = async (payload) => {
-          // Freeze the body: in-flight prefetch may update telemetry during retry.
-          const body = JSON.stringify(payload);
-          let lastError = null;
-          for (let attempt = 0; attempt < 3; attempt += 1) {
-            try {
-              const response = await fetch(sinkUrl, {
-                signal: controller.signal,
-                method: 'POST',
-                headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-                body,
-              });
-              if (response.ok) return JSON.parse(await response.text());
-              lastError = new Error(`Local cache sink returned HTTP ${response.status}.`);
-            } catch (error) {
-              controller.signal.throwIfAborted();
-              lastError = error;
+        const createSinkClient = ({fetch, sleep, signal, url, runId}) => {
+          let nextRequestId = 0;
+          const send = async (kind, payload) => {
+            // Freeze the body: in-flight prefetch may update telemetry during retry.
+            const body = JSON.stringify({schema_version: 3, kind, run_id: runId,
+                request_id: ++nextRequestId, payload});
+            let lastError = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                const response = await fetch(url, {
+                  signal: signal,
+                  method: 'POST',
+                  headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                  body,
+                });
+                if (response.ok) return JSON.parse(await response.text());
+                lastError = new Error(`Local cache sink returned HTTP ${response.status}.`);
+              } catch (error) {
+                signal.throwIfAborted();
+                lastError = error;
+              }
+              await sleep(250 * 2 ** attempt);
             }
-            await sleep(250 * 2 ** attempt);
-          }
-          throw new Error(`Local cache sink failed: ${String(lastError)}`);
+            throw new Error(`Local cache sink failed: ${String(lastError)}`);
+          };
+
+          return {send};
         };
+        const sinkClient = createSinkClient({fetch, sleep, signal: controller.signal, url: sinkUrl, runId: archiveRun});
+        const sendToSink = sinkClient.send;
 
         let pages = 0;
         let scanned = 0;
@@ -385,112 +403,130 @@ async (page) => {
         const pageLimit = archiveCacheOnly ? archiveCachedPages + 1 : hasPageLimit
           ? startPage + maxPages
           : Number.POSITIVE_INFINITY;
-        const maxBufferedPages = Math.max(requestConcurrency * 2, requestConcurrency);
-        const pageBuffer = new Map();
-        const inFlightPages = new Map();
-        let nextPageToFetch = startPage;
-        let stopScheduling = false;
-        // Probe the first remote page in both modes before expanding lookahead.
-        let archiveScheduleThrough = Math.max(startPage, archiveCachedPages + 1);
-        let archiveStopPage = Number.POSITIVE_INFINITY;
+        const createListPipeline = ({getConcurrency, requestJson, pacingSleep, sendToSink}) => {
+          const maxBufferedPages = Math.max(requestConcurrency * 2, requestConcurrency);
+          const pageBuffer = new Map();
+          const inFlightPages = new Map();
+          let nextPageToFetch = startPage;
+          let stopScheduling = false;
+          // Probe the first remote page in both modes before expanding lookahead.
+          let archiveScheduleThrough = Math.max(startPage, archiveCachedPages + 1);
+          let archiveStopPage = Number.POSITIVE_INFINITY;
 
-        const launchListPage = (pageNumber) => {
-          const tracked = (async () => {
-            if (archive && pageNumber <= archiveCachedPages) {
-              const cached = await sendToSink({schema_version: 2, archive_source: true,
-                archive_run: archiveRun, page: pageNumber});
-              if (!Array.isArray(cached.posts)) throw new Error('Invalid cached post batch.');
-              return { posts: cached.posts };
-            }
-            await pacingSleep();
-            const listJson = await requestJson(
-              `${endpoint}?page=${pageNumber - archiveCachedPages}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
-              `list page ${pageNumber}`,
-            );
-            const posts = listJson?.data?.list;
-            if (!Array.isArray(posts)) throw new Error(`Invalid post list on page ${pageNumber}`);
-            {
-              const newest = Number(posts[0]?.timestamp || 0);
-              const oldest = Number(posts.at(-1)?.timestamp || 0);
-              if (!posts.length || (oldest && oldest < scanStartTimestamp)) {
-                archiveStopPage = Math.min(archiveStopPage, pageNumber);
-              } else {
-                const estimatedPages = Math.floor((oldest - scanStartTimestamp) / Math.max(1, newest - oldest));
-                archiveScheduleThrough = Math.max(archiveScheduleThrough,
-                  pageNumber + Math.min(requestConcurrency, Math.max(1, estimatedPages)));
+          const launchListPage = (pageNumber) => {
+            const tracked = (async () => {
+              if (archive && pageNumber <= archiveCachedPages) {
+                const cached = await sendToSink('archive_source', {
+                   page: pageNumber});
+                if (!Array.isArray(cached.posts)) throw new Error('Invalid cached post batch.');
+                return { posts: cached.posts };
               }
-            }
-            return { pageNumber, posts };
-          })()
-            .then(
-              (result) => pageBuffer.set(pageNumber, result),
-              (error) => pageBuffer.set(pageNumber, { pageNumber, error }),
-            )
-            .finally(() => inFlightPages.delete(pageNumber));
-          inFlightPages.set(pageNumber, tracked);
-        };
+              await pacingSleep();
+              const listJson = await requestJson(
+                `${endpoint}?page=${pageNumber - archiveCachedPages}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
+                `list page ${pageNumber}`,
+              );
+              const posts = listJson?.data?.list;
+              if (!Array.isArray(posts)) throw new Error(`Invalid post list on page ${pageNumber}`);
+              {
+                const newest = Number(posts[0]?.timestamp || 0);
+                const oldest = Number(posts.at(-1)?.timestamp || 0);
+                if (!posts.length || (oldest && oldest < scanStartTimestamp)) {
+                  archiveStopPage = Math.min(archiveStopPage, pageNumber);
+                } else {
+                  const estimatedPages = Math.floor((oldest - scanStartTimestamp) / Math.max(1, newest - oldest));
+                  archiveScheduleThrough = Math.max(archiveScheduleThrough,
+                    pageNumber + Math.min(requestConcurrency, Math.max(1, estimatedPages)));
+                }
+              }
+              return { pageNumber, posts };
+            })()
+              .then(
+                (result) => pageBuffer.set(pageNumber, result),
+                (error) => pageBuffer.set(pageNumber, { pageNumber, error }),
+              )
+              .finally(() => inFlightPages.delete(pageNumber));
+            inFlightPages.set(pageNumber, tracked);
+          };
 
-        const fillListRequestSlots = () => {
-          while (
-            !stopScheduling &&
-            inFlightPages.size < effectiveConcurrency &&
-            nextPageToFetch < pageLimit &&
-            nextPageToFetch <= archiveScheduleThrough && nextPageToFetch <= archiveStopPage &&
-            inFlightPages.size + pageBuffer.size < maxBufferedPages
-          ) {
-            const pageNumber = nextPageToFetch;
-            nextPageToFetch += 1;
-            launchListPage(pageNumber);
-          }
-        };
-
-        const takeListPageInOrder = async (pageNumber) => {
-          fillListRequestSlots();
-          while (!pageBuffer.has(pageNumber)) {
-            if (!inFlightPages.size) {
-              throw new Error(`No list request can provide page ${pageNumber}.`);
+          const fillListRequestSlots = () => {
+            while (
+              !stopScheduling &&
+              inFlightPages.size < getConcurrency() &&
+              nextPageToFetch < pageLimit &&
+              nextPageToFetch <= archiveScheduleThrough && nextPageToFetch <= archiveStopPage &&
+              inFlightPages.size + pageBuffer.size < maxBufferedPages
+            ) {
+              const pageNumber = nextPageToFetch;
+              nextPageToFetch += 1;
+              launchListPage(pageNumber);
             }
-            await Promise.race([...inFlightPages.values()]);
+          };
+
+          const takeListPageInOrder = async (pageNumber) => {
             fillListRequestSlots();
-          }
-          const result = pageBuffer.get(pageNumber);
-          pageBuffer.delete(pageNumber);
-          if (result.error) throw result.error;
-          return result;
+            while (!pageBuffer.has(pageNumber)) {
+              if (!inFlightPages.size) {
+                throw new Error(`No list request can provide page ${pageNumber}.`);
+              }
+              await Promise.race([...inFlightPages.values()]);
+              fillListRequestSlots();
+            }
+            const result = pageBuffer.get(pageNumber);
+            pageBuffer.delete(pageNumber);
+            if (result.error) throw result.error;
+            return result;
+          };
+
+          return {
+            take: takeListPageInOrder,
+            stop() { stopScheduling = true; },
+            settle: () => Promise.all([...inFlightPages.values()]),
+            overfetch: (pageNumber) => Math.max(0, nextPageToFetch - (pageNumber + 1)),
+          };
         };
+        const listPipeline = createListPipeline({getConcurrency: () => scheduler.concurrency,
+          requestJson, pacingSleep, sendToSink});
 
         // Share post workers across a bounded window of list pages. Duplicate
         // PIDs are serialized so two snapshots cannot race their comment cursor.
-        const postQueue = [];
-        const postWorkByPid = new Map();
-        let activePostWorkers = 0;
-        let nextMediaPlan = 0;
-        const drainPostQueue = () => {
-          while (postQueue.length && activePostWorkers < effectiveConcurrency) {
-            const {worker, resolve, reject} = postQueue.shift();
-            activePostWorkers += 1;
-            Promise.resolve().then(() => {
-              controller.signal.throwIfAborted();
-              return worker();
-            }).then(resolve, reject).finally(() => {
-              activePostWorkers -= 1;
+        const createPostQueue = ({getConcurrency, signal}) => {
+          const postQueue = [];
+          const postWorkByPid = new Map();
+          let activePostWorkers = 0;
+          const drainPostQueue = () => {
+            while (postQueue.length && activePostWorkers < getConcurrency()) {
+              const {worker, resolve, reject} = postQueue.shift();
+              activePostWorkers += 1;
+              Promise.resolve().then(() => {
+                signal.throwIfAborted();
+                return worker();
+              }).then(resolve, reject).finally(() => {
+                activePostWorkers -= 1;
+                drainPostQueue();
+              });
+            }
+          };
+          const schedulePost = (pid, worker) => {
+            const previous = postWorkByPid.get(pid) || Promise.resolve();
+            const work = previous.then(() => new Promise((resolve, reject) => {
+              postQueue.push({worker, resolve, reject});
               drainPostQueue();
-            });
-          }
-        };
-        const schedulePost = (pid, worker) => {
-          const previous = postWorkByPid.get(pid) || Promise.resolve();
-          const work = previous.then(() => new Promise((resolve, reject) => {
-            postQueue.push({worker, resolve, reject});
-            drainPostQueue();
-          }));
-          postWorkByPid.set(pid, work);
-          const forget = () => { if (postWorkByPid.get(pid) === work) postWorkByPid.delete(pid); };
-          work.then(forget, forget);
-          return work;
-        };
+            }));
+            postWorkByPid.set(pid, work);
+            const forget = () => { if (postWorkByPid.get(pid) === work) postWorkByPid.delete(pid); };
+            work.then(forget, forget);
+            return work;
+          };
 
-        const processListPage = async (posts, cachedPage) => {
+          return {schedule: schedulePost, settle: () => Promise.allSettled([...postWorkByPid.values()])};
+        };
+        const posts = createPostQueue({getConcurrency: () => scheduler.concurrency, signal: controller.signal});
+        const schedulePost = posts.schedule;
+
+        const createPostArchiver = ({requestJson, pacingSleep, sendToSink, schedulePost, getConcurrency}) => {
+          let nextMediaPlan = 0;
+          const processListPage = async (posts, cachedPage) => {
             const pendingRows = [];
             const pendingUnavailableByPid = new Map();
             const rowsByPid = new Map();
@@ -534,7 +570,7 @@ async (page) => {
               (post) => !cachedPage && minFavorites !== null && post.favorites === null
                 && post.timestamp >= reportStartTimestamp && post.timestamp < endTimestamp,
             );
-            await mapLimit(missingFavorites, effectiveConcurrency, async (post) => {
+            await mapLimit(missingFavorites, getConcurrency(), async (post) => {
               await fetchAndApplyDetail(post, null);
             });
 
@@ -550,13 +586,12 @@ async (page) => {
                 !post.text.trim() &&
                 !detailsFetchedPids.has(post.pid),
             );
-            await mapLimit(missingText, effectiveConcurrency, async (post) => {
+            await mapLimit(missingText, getConcurrency(), async (post) => {
               await fetchAndApplyDetail(post, post.favorites);
             });
             pageMatches = pageMatches.filter(matchesThresholds);
             if (archive) {
-              const prepared = pageMatches.length ? await sendToSink({
-                schema_version: 2, archive_prepare: true, archive_run: archiveRun, posts: pageMatches,
+              const prepared = pageMatches.length ? await sendToSink('archive_prepare', {posts: pageMatches,
               }) : {resumes: {}};
               // One resume lookup per post batch, then bounded comment chunks.
               await Promise.all(pageMatches.map((post) => schedulePost(post.pid, async () => {
@@ -568,13 +603,13 @@ async (page) => {
                     await pacingSleep();
                     const detail = await requestJson(`/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`, `detail image metadata #${post.pid}`, false, true);
                     if (detail.unavailable) {
-                      await sendToSink({schema_version: 2, archive_media_unavailable: true, archive_run: archiveRun, post});
+                      await sendToSink('archive_media_unavailable', {post});
                       return;
                     }
                     if (!detail?.data?.hole) throw new Error(`Missing image metadata for #${post.pid}`);
                     post.media_ids = mediaIds(detail.data.hole.media_ids);
                   }
-                  await sendToSink({schema_version: 2, archive_post_media: true, archive_run: archiveRun, post});
+                  await sendToSink('archive_post_media', {post});
                 }
                 if (!resume.complete) {
                 const seen = new Set();
@@ -590,7 +625,7 @@ async (page) => {
                     `detail comments #${post.pid} page ${commentPage}`, false, extractImages,
                   );
                   if (data.unavailable) {
-                    await sendToSink({schema_version: 2, archive_media_unavailable: true, archive_run: archiveRun, post});
+                    await sendToSink('archive_media_unavailable', {post});
                     return;
                   }
                   const comments = data?.data?.list;
@@ -619,9 +654,8 @@ async (page) => {
                   const complete = !comments.length || collected.size >= maxComments;
                   batchPages += 1;
                   if (batchPages >= commentBatchPages || complete) {
-                    await sendToSink({
-                      schema_version: 2, archive_comments: true, post,
-                      archive_run: archiveRun,
+                    await sendToSink('archive_comments', { post,
+
                       comment_page: commentPage, comment_page_size: commentPageSize, comments: pendingComments,
                       complete,
                     });
@@ -633,13 +667,13 @@ async (page) => {
                 }
                 if (downloadImages) {
                   while (true) {
-                    const planned = await sendToSink({schema_version: 2, archive_media_plan: true,
-                      plan_id: String(++nextMediaPlan), archive_run: archiveRun, post});
+                    const planned = await sendToSink('archive_media_plan', {
+                      plan_id: String(++nextMediaPlan),  post});
                     if (!planned.images?.length) break;
-                    await mapLimit(planned.images, effectiveConcurrency, async (item) => {
+                    await mapLimit(planned.images, getConcurrency(), async (item) => {
                       await pacingSleep();
                       const file = await requestJson(item.url, `image ${item.media_key}`, true);
-                      await sendToSink({schema_version: 2, archive_media_file: true, archive_run: archiveRun,
+                      await sendToSink('archive_media_file', {
                         post, media_key: item.media_key, ...file});
                     });
                   }
@@ -648,7 +682,12 @@ async (page) => {
             }
             return {rows: pendingRows, matches: archive ? [] : pageMatches.map(post => post.pid),
               unavailable: [...pendingUnavailableByPid.values()]};
+          };
+
+          return {processPage: processListPage};
         };
+        const postArchiver = createPostArchiver({requestJson, pacingSleep, sendToSink, schedulePost,
+          getConcurrency: () => scheduler.concurrency});
 
         const processingPages = new Map();
         const pipelineWaiters = [];
@@ -669,7 +708,7 @@ async (page) => {
             controller.signal.throwIfAborted();
             if (pageFailure) break;
             const cachedPage = archive && pageNumber <= archiveCachedPages;
-            const {posts} = await takeListPageInOrder(pageNumber);
+            const {posts} = await listPipeline.take(pageNumber);
             controller.signal.throwIfAborted();
             // Exact PID-set repeats/cycles are abnormal; partial overlap is normal
             // on a changing feed. Keep only a bounded recent-page window.
@@ -686,11 +725,11 @@ async (page) => {
             const reached = exhausted || (!cachedPage && oldest > 0 && oldest < scanStartTimestamp)
               || (archiveCacheOnly && pageNumber === archiveCachedPages);
             const terminal = reached || pageNumber + 1 === pageLimit;
-            if (terminal) stopScheduling = true;
-            const work = processListPage(posts, cachedPage).then(
+            if (terminal) listPipeline.stop();
+            const work = postArchiver.processPage(posts, cachedPage).then(
               result => ({...result, cachedPage, oldest, scanned: posts.length,
                 reachedStart: reached, feedExhausted: exhausted, terminal}),
-              error => { pageFailure = true; stopScheduling = true; wakePipeline(); return {error}; });
+              error => { pageFailure = true; listPipeline.stop(); wakePipeline(); return {error}; });
             processingPages.set(pageNumber, work);
             wakePipeline();
             if (terminal) break;
@@ -698,14 +737,14 @@ async (page) => {
         })().catch(error => {
           // Deliver discovery errors after earlier pages have committed.
           processingPages.set(producerPageNumber, Promise.resolve({error}));
-          stopScheduling = true;
+          listPipeline.stop();
         }).finally(() => { producerDone = true; wakePipeline(); });
         settleWork = async () => {
           wakePipeline();
           await producer;
           await Promise.all([...processingPages.values()]);
-          await Promise.allSettled([...postWorkByPid.values()]);
-          await Promise.all([...inFlightPages.values()]);
+          await posts.settle();
+          await listPipeline.settle();
         };
 
         while (true) {
@@ -727,12 +766,9 @@ async (page) => {
             reachedStart = result.reachedStart;
             feedExhausted = result.feedExhausted;
             if (terminal) {
-              stopScheduling = true;
-              await Promise.all([...inFlightPages.values()]);
-              chunkTelemetry.overfetch_pages += Math.max(
-                0,
-                nextPageToFetch - (pageNumber + 1),
-              );
+              listPipeline.stop();
+              await listPipeline.settle();
+              telemetry.add('overfetch_pages', listPipeline.overfetch(pageNumber));
             }
             const checkpoint =
               (pagesBefore + pages) % checkpointPages === 0 || terminal;
@@ -742,9 +778,8 @@ async (page) => {
             // Never let a multi-page cache chunk straddle that boundary.
             const cacheBoundary = cachedPage && pageNumber === archiveCachedPages;
             if (chunkFull || terminal || checkpoint || cacheBoundary) {
-              const snapshot = telemetrySnapshot();
-              await sendToSink({
-                schema_version: 2,
+              const snapshot = telemetry.snapshot();
+              await sendToSink('list_chunk', {
                 archive_cached: cachedPage,
                 start_page: chunkStartPage,
                 end_page: pageNumber,
@@ -758,14 +793,14 @@ async (page) => {
                 rows: cachedPage ? [] : pendingRows,
                 matched_pids: [...pendingMatchedPids],
                 favorite_unavailable: cachedPage ? [] : [...pendingUnavailableByPid.values()],
-                telemetry: telemetryDelta(snapshot),
+                telemetry: telemetry.delta(snapshot),
               });
               chunkStartPage = pageNumber + 1;
               chunkScanned = 0;
               pendingRows = [];
               pendingMatchedPids = new Set();
               pendingUnavailableByPid = new Map();
-              reportedTelemetry = snapshot;
+              telemetry.acknowledge(snapshot);
             }
             processingPages.delete(pageNumber);
             wakePipeline();
@@ -774,8 +809,8 @@ async (page) => {
 
         // Account for requests completed during callbacks and the final data
         // callback itself. This receipt changes no page/checkpoint positions.
-        await sendToSink({schema_version: 2, telemetry_final: true,
-          telemetry: telemetryDelta(telemetrySnapshot())});
+        await sendToSink('telemetry_final', {
+          telemetry: telemetry.delta(telemetry.snapshot())});
 
         return null;
         } finally {

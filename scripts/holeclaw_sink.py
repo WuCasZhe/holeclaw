@@ -10,12 +10,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
+    from holeclaw_protocol import ReceiptBook, SinkMessage
     from holeclaw_cache import CacheStore
-    from holeclaw_checkpoint import empty_telemetry, merge_telemetry, write_checkpoint
+    from holeclaw_checkpoint import CheckpointState, empty_telemetry, merge_telemetry, write_checkpoint
     from holeclaw_domain import CliError, FilterSpec, SHANGHAI, SINK_SCHEMA_VERSION
 except ModuleNotFoundError:
+    from scripts.holeclaw_protocol import ReceiptBook, SinkMessage
     from scripts.holeclaw_cache import CacheStore
     from scripts.holeclaw_checkpoint import (
+        CheckpointState,
         empty_telemetry,
         merge_telemetry,
         write_checkpoint,
@@ -43,6 +46,7 @@ class RunSink:
     ):
         self.cache = cache
         self.checkpoint = checkpoint
+        self.state = CheckpointState(checkpoint)
         self.checkpoint_path = checkpoint_path
         self.filter_spec = FilterSpec(min_comments, min_favorites, match_mode)
         self.lock = threading.RLock()
@@ -53,21 +57,37 @@ class RunSink:
         self.last_chunk_digest: bytes | None = None
         self.final_telemetry_digest: bytes | None = None
         self.cancel_event = threading.Event()
+        self.receipts = ReceiptBook()
 
     def cancel(self) -> None:
         self.cancel_event.set()
 
     def record_post_date(self, timestamp: int) -> None:
-        if timestamp > 0:
-            previous = self.checkpoint.get("oldest_post_timestamp", 0)
-            self.checkpoint["oldest_post_timestamp"] = min(previous, timestamp) if previous else timestamp
+        self.state.record_post_date(timestamp)
 
     def post_date_label(self) -> str:
         timestamp = self.checkpoint.get("oldest_post_timestamp", 0)
         return (f"帖子最后日期（最旧）：{datetime.fromtimestamp(timestamp, SHANGHAI):%Y-%m-%d %H:%M}"
                 if timestamp else "帖子最后日期：暂无")
 
-    def ingest(self, payload: dict) -> None:
+    def ingest(self, payload: dict) -> dict | None:
+        message = SinkMessage.decode(payload, self.checkpoint['created_at'])
+        with self.lock:
+            if self.cancel_event.is_set():
+                raise CliError('Collector cancelled.')
+            found, receipt = self.receipts.lookup(message)
+            if found:
+                return receipt
+            receipt = self.dispatch(message.kind, message.payload)
+            self.receipts.remember(message, receipt)
+            return receipt
+
+    def dispatch(self, kind: str, payload: dict):
+        if kind not in ('list_chunk', 'telemetry_final'):
+            raise CliError('Archive message requires an archive sink.')
+        return self.ingest_list(payload)
+
+    def ingest_list(self, payload: dict) -> None:
         if self.cancel_event.is_set():
             raise CliError("Collector cancelled.")
         if payload.get("schema_version") != SINK_SCHEMA_VERSION:
@@ -164,24 +184,16 @@ class RunSink:
             merge_telemetry(chunk_telemetry, dict(payload.get("telemetry") or {}))
             cache_started = time.perf_counter()
             with self.cache.transaction():
-                self.cache.record_favorite_unavailable(unavailable, commit=False)
-                self.cache.upsert_posts(rows, commit=False)
+                self.cache.record_favorite_unavailable(unavailable)
+                self.cache.upsert_posts(rows)
             chunk_telemetry["cache_write_ms"] = round(
                 (time.perf_counter() - cache_started) * 1000
             )
             merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
             if missing_report_favorites and self.filter_spec.min_favorites is None:
                 self.checkpoint["favorites_complete"] = False
-            for pid in validated_match_pids:
-                self.checkpoint["matched_by_pid"][pid] = True
-
-            self.checkpoint["next_page"] = end_page + 1
-            self.checkpoint["total_pages"] += pages
-            self.checkpoint["total_scanned"] += scanned
-            self.checkpoint["reached_start"] = bool(payload.get("reached_start"))
-            self.checkpoint["feed_exhausted"] = bool(payload.get("feed_exhausted"))
-            self.checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
-            self.record_post_date(int(payload.get("oldest", 0)))
+            self.state.commit_pages(dict(payload, end_page=end_page, pages=pages, scanned=scanned),
+                                    validated_match_pids)
             self.last_progress = {
                 "page": end_page,
                 "pages": self.checkpoint["total_pages"],
@@ -225,6 +237,12 @@ class RunSink:
 
 
 class SinkServer:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
     def __init__(self, sink: RunSink):
         self.server_cancel = sink.cancel
         token = secrets.token_urlsafe(24)

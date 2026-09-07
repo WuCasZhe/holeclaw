@@ -1,11 +1,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {unpackSinkMessage} = require('./sink_protocol_fixture');
 
 const collectorPath = path.join(__dirname, '..', 'scripts', 'collect.js');
-const collector = vm.runInThisContext(fs.readFileSync(collectorPath, 'utf8'), {
-  filename: collectorPath,
-});
+const collectorSource = fs.readFileSync(collectorPath, 'utf8');
 
 const response = (body, { status = 200, retryAfter = null } = {}) => ({
   status,
@@ -16,22 +15,29 @@ const response = (body, { status = 200, retryAfter = null } = {}) => ({
   text: async () => JSON.stringify(body),
 });
 
-async function runCollector({ config, remoteFetch, sinkFetch, onSleep = () => {} }) {
+async function runCollector({ config, remoteFetch, sinkFetch, wireSinkFetch, onSleep = () => {} }) {
   const sinkPayloads = [];
-  const originalFetch = global.fetch;
-  const originalSetTimeout = global.setTimeout;
-  global.setTimeout = (callback, milliseconds = 0) => {
+  const wirePayloads = [];
+  const immediateTimer = (callback, milliseconds = 0) => {
     onSleep(milliseconds);
     callback();
     return 0;
   };
-  global.fetch = async (url, options = {}) => {
+  const fetch = async (url, options = {}) => {
     if (String(url).startsWith(config.sink_url)) {
-      sinkPayloads.push(JSON.parse(options.body));
-      return sinkFetch ? sinkFetch(url, options) : response({ ok: true });
+      const wire = JSON.parse(options.body);
+      wirePayloads.push(wire);
+      const payload = unpackSinkMessage(wire);
+      sinkPayloads.push(payload);
+      if (wireSinkFetch) return wireSinkFetch(url, options);
+      return sinkFetch ? sinkFetch(url, {...options, body: JSON.stringify(payload)}) : response({ ok: true });
     }
     return remoteFetch(url, options);
   };
+  const collector = vm.runInNewContext(collectorSource, {
+    fetch, setTimeout: immediateTimer, clearTimeout, AbortController, URL, performance,
+    Date, Math, btoa,
+  }, {filename: collectorPath});
 
   let evaluateCount = 0;
   const page = {
@@ -45,14 +51,9 @@ async function runCollector({ config, remoteFetch, sinkFetch, onSleep = () => {}
     reload: async () => undefined,
   };
 
-  try {
-    const result = await collector(page);
-    return { result, sinkPayloads: sinkPayloads.filter(payload => !payload.telemetry_final),
-      telemetryPayloads: sinkPayloads.filter(payload => payload.telemetry_final) };
-  } finally {
-    global.fetch = originalFetch;
-    global.setTimeout = originalSetTimeout;
-  }
+  const result = await collector(page);
+  return { result, wirePayloads, sinkPayloads: sinkPayloads.filter(payload => !payload.telemetry_final),
+    telemetryPayloads: sinkPayloads.filter(payload => payload.telemetry_final) };
 }
 
 module.exports = { response, runCollector };

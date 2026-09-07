@@ -1,3 +1,4 @@
+from scripts import holeclaw_browser as browser_runtime, holeclaw_digest as digest_runtime
 import argparse
 import json
 import importlib.util
@@ -260,7 +261,7 @@ class StandaloneTests(unittest.TestCase):
     def test_find_pwcli_uses_native_windows_wrapper(self) -> None:
         with (
             patch.dict(run_digest.os.environ, {"PWCLI": ""}),
-            patch.object(run_digest, "running_on_windows", return_value=True),
+            patch.object(browser_runtime, "running_on_windows", return_value=True),
             patch.object(run_digest.shutil, "which", return_value="npx.cmd"),
         ):
             self.assertEqual(
@@ -270,7 +271,7 @@ class StandaloneTests(unittest.TestCase):
 
     def test_non_interactive_browser_session_opens_headless(self) -> None:
         with patch.object(
-            run_digest, "find_pwcli", return_value=Path("/tmp/playwright-cli")
+            browser_runtime, "find_pwcli", return_value=Path("/tmp/playwright-cli")
         ):
             browser = run_digest.BrowserCli("scheduler", headed=False)
         browser.run = MagicMock()
@@ -285,7 +286,7 @@ class StandaloneTests(unittest.TestCase):
     def test_browser_cli_decodes_playwright_output_as_utf8(self) -> None:
         completed = argparse.Namespace(stdout="北大树洞", stderr="", returncode=0)
         with patch.object(
-            run_digest, "find_pwcli", return_value=Path("/tmp/playwright-cli")
+            browser_runtime, "find_pwcli", return_value=Path("/tmp/playwright-cli")
         ):
             browser = run_digest.BrowserCli("utf8-session")
         with patch.object(
@@ -312,7 +313,7 @@ class StandaloneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = self.parse_standalone("--non-interactive")
             args.state = Path(directory) / "missing.json"
-            with patch.object(run_digest, "BrowserCli", FakeBrowser):
+            with patch.object(browser_runtime, "BrowserCli", FakeBrowser):
                 with self.assertRaisesRegex(run_digest.CliError, "--non-interactive"):
                     run_digest.ensure_standalone_login(args)
 
@@ -341,21 +342,21 @@ class StandaloneTests(unittest.TestCase):
             state.touch()
             args = self.parse_standalone("--non-interactive")
             args.state = state
-            with patch.object(run_digest, "BrowserCli", FakeBrowser):
+            with patch.object(browser_runtime, "BrowserCli", FakeBrowser):
                 with patch("builtins.input", side_effect=AssertionError("must not prompt")):
                     browser = run_digest.ensure_standalone_login(args)
         self.assertIsInstance(browser, FakeBrowser)
 
     def test_standalone_defers_login_until_network_collection(self) -> None:
         args = self.parse_standalone("--days", "7")
-        with patch.object(run_digest, "run_digest") as digest:
+        with patch.object(digest_runtime, "run_digest") as digest:
             run_digest.run_standalone(args)
-        digest.assert_called_once_with(args, standalone=True)
+        digest.assert_called_once_with(args, standalone=True, services=None)
 
 
 class RuntimeRoutingTests(unittest.TestCase):
     def test_windows_short_paths_support_separate_equals_and_attached_values(self):
-        with patch.object(run_digest, 'windows_native_path', side_effect=lambda value: 'WIN:' + value):
+        with patch.object(browser_runtime, 'windows_native_path', side_effect=lambda value: 'WIN:' + value):
             self.assertEqual(run_digest.windows_cli_arguments([
                 '-s', '/home/state.json', 'archive', '-a', 'test', '-C=/mnt/c/archive.db',
                 '-S/mnt/c/source.db', '-k', '/home/cp.json', '-o/home/out.json', '-d300']),
@@ -364,7 +365,7 @@ class RuntimeRoutingTests(unittest.TestCase):
 
     def test_windows_cli_arguments_convert_only_path_options(self) -> None:
         converter = lambda value: f"WIN:{value}" if value.startswith("/") else value
-        with patch.object(run_digest, "windows_native_path", side_effect=converter):
+        with patch.object(browser_runtime, "windows_native_path", side_effect=converter):
             converted = run_digest.windows_cli_arguments([
                 "--state", "/home/user/state.json",
                 "run",
@@ -382,8 +383,8 @@ class RuntimeRoutingTests(unittest.TestCase):
 
     def test_wsl_with_native_npx_stays_in_wsl(self) -> None:
         with (
-            patch.object(run_digest, "is_wsl", return_value=True),
-            patch.object(run_digest, "playwright_npx_path", return_value="/usr/bin/npx"),
+            patch.object(browser_runtime, "is_wsl", return_value=True),
+            patch.object(browser_runtime, "playwright_npx_path", return_value="/usr/bin/npx"),
             patch.object(run_digest.subprocess, "run") as execute,
         ):
             self.assertIsNone(run_digest.maybe_reexec_windows_runtime(["run"]))
@@ -392,8 +393,8 @@ class RuntimeRoutingTests(unittest.TestCase):
     def test_native_wsl_paths_stay_posix(self):
         path = Path("scripts/collect.js")
         with (
-            patch.object(run_digest, "is_wsl", return_value=True),
-            patch.object(run_digest, "windows_native_path") as convert,
+            patch.object(browser_runtime, "is_wsl", return_value=True),
+            patch.object(browser_runtime, "windows_native_path") as convert,
         ):
             self.assertEqual(run_digest.native_path(path), str(path.resolve()))
         convert.assert_not_called()
@@ -401,19 +402,19 @@ class RuntimeRoutingTests(unittest.TestCase):
     def test_wsl_with_windows_npx_reexecutes_windows_python(self) -> None:
         completed = argparse.Namespace(returncode=7)
         with (
-            patch.object(run_digest, "is_wsl", return_value=True),
+            patch.object(browser_runtime, "is_wsl", return_value=True),
             patch.object(
-                run_digest,
+                browser_runtime,
                 "playwright_npx_path",
                 return_value="/mnt/c/Program Files/nodejs/npx",
             ),
             patch.object(
-                run_digest,
+                browser_runtime,
                 "windows_python_command",
                 return_value=["/mnt/c/Python/python.exe"],
             ),
             patch.object(
-                run_digest,
+                browser_runtime,
                 "windows_native_path",
                 side_effect=lambda value: f"WIN:{value}" if value.startswith("/") else value,
             ),
@@ -438,7 +439,7 @@ class RuntimeRoutingTests(unittest.TestCase):
 
     def test_windows_native_path_detection_does_not_treat_unc_cwd_as_wsl(self) -> None:
         with (
-            patch.object(run_digest, "running_on_windows", return_value=True),
+            patch.object(browser_runtime, "running_on_windows", return_value=True),
             patch.dict(run_digest.os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}),
         ):
             self.assertFalse(run_digest.is_wsl())
@@ -503,10 +504,10 @@ class WorkflowTests(unittest.TestCase):
             server = MagicMock()
             server.url = "http://127.0.0.1:12345/ingest?token=test"
             with (
-                patch.object(run_digest, "ensure_standalone_login", return_value=MagicMock()),
-                patch.object(run_digest, "SinkServer", return_value=server),
+                patch.object(digest_runtime, "ensure_standalone_login", return_value=MagicMock()),
+                patch.object(digest_runtime, "SinkServer", return_value=server),
                 patch.object(
-                    run_digest,
+                    digest_runtime,
                     "run_persistent_collector",
                     side_effect=KeyboardInterrupt,
                 ),
@@ -578,7 +579,7 @@ class WorkflowTests(unittest.TestCase):
             cache.close()
 
             with patch.object(
-                run_digest,
+                digest_runtime,
                 "ensure_standalone_login",
                 side_effect=AssertionError("cache hit must not initialize a browser"),
             ):
@@ -618,9 +619,9 @@ class WorkflowTests(unittest.TestCase):
             cache.close()
 
             with (
-                patch.object(run_digest, "emit_cached_report") as emit,
+                patch.object(digest_runtime, "emit_cached_report") as emit,
                 patch.object(
-                    run_digest,
+                    digest_runtime,
                     "ensure_standalone_login",
                     side_effect=AssertionError("cache reuse must not initialize a browser"),
                 ),
@@ -667,7 +668,7 @@ class WorkflowTests(unittest.TestCase):
             cache.close()
 
             with patch.object(
-                run_digest,
+                digest_runtime,
                 "ensure_standalone_login",
                 side_effect=RuntimeError("network collection reached"),
             ) as login:
