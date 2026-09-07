@@ -11,7 +11,7 @@ const config = {
   match_mode: 'all',
   start_page: 1,
   page_size: 500,
-  max_pages: 6,
+  max_pages: null,
   pages_before: 0,
   checkpoint_pages: 100,
   cache_chunk_pages: 1,
@@ -36,12 +36,12 @@ const remoteFetch = async (url) => {
   events.push(`start:${pageNumber}`);
   remoteInFlight += 1;
   maxRemoteInFlight = Math.max(maxRemoteInFlight, remoteInFlight);
-  if (pageNumber === 1) {
+  if (pageNumber === 2) {
     await firstPageGate;
   } else {
     await new Promise((resolve) => setImmediate(resolve));
   }
-  if (pageNumber === 4) releaseFirstPage();
+  if (pageNumber === 5) releaseFirstPage();
   remoteInFlight -= 1;
   events.push(`done:${pageNumber}`);
   return response({
@@ -63,8 +63,8 @@ const remoteFetch = async (url) => {
   const { sinkPayloads } = await runCollector({ config, remoteFetch });
   assert.equal(maxRemoteInFlight, 3);
   assert.ok(
-    events.indexOf('start:4') < events.indexOf('done:1'),
-    'a free worker should fetch page 4 before slow page 1 completes',
+    events.indexOf('start:5') < events.indexOf('done:2'),
+    'after the probe, a free worker must fetch page 5 before slow page 2 completes',
   );
   assert.deepEqual(
     sinkPayloads.map((payload) => payload.start_page),

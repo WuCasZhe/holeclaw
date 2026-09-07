@@ -11,6 +11,9 @@ SINK_SCHEMA_VERSION = 2
 TELEMETRY_FIELDS = (
     "list_requests",
     "detail_requests",
+    "comment_requests",
+    "image_requests",
+    "image_bytes",
     "request_ms",
     "pacing_ms",
     "retry_backoff_ms",

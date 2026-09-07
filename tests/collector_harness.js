@@ -16,7 +16,7 @@ const response = (body, { status = 200, retryAfter = null } = {}) => ({
   text: async () => JSON.stringify(body),
 });
 
-async function runCollector({ config, remoteFetch, onSleep = () => {} }) {
+async function runCollector({ config, remoteFetch, sinkFetch, onSleep = () => {} }) {
   const sinkPayloads = [];
   const originalFetch = global.fetch;
   const originalSetTimeout = global.setTimeout;
@@ -28,7 +28,7 @@ async function runCollector({ config, remoteFetch, onSleep = () => {} }) {
   global.fetch = async (url, options = {}) => {
     if (String(url).startsWith(config.sink_url)) {
       sinkPayloads.push(JSON.parse(options.body));
-      return response({ ok: true });
+      return sinkFetch ? sinkFetch(url, options) : response({ ok: true });
     }
     return remoteFetch(url, options);
   };
@@ -47,7 +47,8 @@ async function runCollector({ config, remoteFetch, onSleep = () => {} }) {
 
   try {
     const result = await collector(page);
-    return { result, sinkPayloads };
+    return { result, sinkPayloads: sinkPayloads.filter(payload => !payload.telemetry_final),
+      telemetryPayloads: sinkPayloads.filter(payload => payload.telemetry_final) };
   } finally {
     global.fetch = originalFetch;
     global.setTimeout = originalSetTimeout;

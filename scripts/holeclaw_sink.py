@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import json
 import secrets
@@ -49,15 +50,57 @@ class RunSink:
         self.last_progress: dict | None = None
         self.progress_sequence = 0
         self.terminal_result: dict | None = None
+        self.last_chunk_digest: bytes | None = None
+        self.final_telemetry_digest: bytes | None = None
+        self.cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def record_post_date(self, timestamp: int) -> None:
+        if timestamp > 0:
+            previous = self.checkpoint.get("oldest_post_timestamp", 0)
+            self.checkpoint["oldest_post_timestamp"] = min(previous, timestamp) if previous else timestamp
+
+    def post_date_label(self) -> str:
+        timestamp = self.checkpoint.get("oldest_post_timestamp", 0)
+        return (f"帖子最后日期（最旧）：{datetime.fromtimestamp(timestamp, SHANGHAI):%Y-%m-%d %H:%M}"
+                if timestamp else "帖子最后日期：暂无")
 
     def ingest(self, payload: dict) -> None:
+        if self.cancel_event.is_set():
+            raise CliError("Collector cancelled.")
         if payload.get("schema_version") != SINK_SCHEMA_VERSION:
             raise CliError("Collector sink schema mismatch.")
         with self.lock:
+            if self.cancel_event.is_set():
+                raise CliError("Collector cancelled.")
             start_page = int(payload.get("start_page", 0))
             end_page = int(payload.get("end_page", 0))
             pages = int(payload.get("pages", 0))
             scanned = int(payload.get("scanned", 0))
+            digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).digest()
+            if payload.get('telemetry_final'):
+                if self.terminal_result is None:
+                    raise CliError('Final telemetry requires a committed terminal page.')
+                if self.final_telemetry_digest is not None:
+                    if digest != self.final_telemetry_digest:
+                        raise CliError('Final telemetry receipt changed.')
+                else:
+                    delta = empty_telemetry()
+                    merge_telemetry(delta, dict(payload.get('telemetry') or {}))
+                    merge_telemetry(self.checkpoint['telemetry'], delta)
+                    self.final_telemetry_digest = digest
+                write_checkpoint(self.checkpoint_path, self.checkpoint)
+                return
+            # The browser sends one chunk at a time. Retain only the last receipt;
+            # a lost HTTP response must not replay writes or progress counters.
+            if digest == self.last_chunk_digest:
+                if payload.get("checkpoint") or payload.get("terminal"):
+                    write_checkpoint(self.checkpoint_path, self.checkpoint)
+                return
             if (
                 start_page != self.checkpoint["next_page"]
                 or end_page < start_page
@@ -87,16 +130,21 @@ class RunSink:
             missing_favorite_pids = {
                 str(row.get("pid", "")) for row in rows if row.get("favorites") is None
             }
+            report_start = self.checkpoint["start_timestamp"]
+            report_end = self.checkpoint["end_timestamp"]
+            missing_report_favorites = {
+                str(row.get("pid", "")) for row in rows
+                if row.get("favorites") is None
+                and report_start <= int(row.get("timestamp", 0)) < report_end
+            }
             if not unavailable_pids.issubset(missing_favorite_pids):
                 raise CliError("Collector marked a known favorite count as unavailable.")
             if (
                 self.filter_spec.min_favorites is not None
-                and not missing_favorite_pids.issubset(unavailable_pids)
+                and not missing_report_favorites.issubset(unavailable_pids)
             ):
                 raise CliError("Collector omitted favorite counts or availability metadata.")
 
-            report_start = self.checkpoint["start_timestamp"]
-            report_end = self.checkpoint["end_timestamp"]
             validated_match_pids = []
             rows_by_pid = {str(row.get("pid", "")): row for row in rows}
             for pid in matched_pids:
@@ -122,7 +170,7 @@ class RunSink:
                 (time.perf_counter() - cache_started) * 1000
             )
             merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            if missing_favorite_pids and self.filter_spec.min_favorites is None:
+            if missing_report_favorites and self.filter_spec.min_favorites is None:
                 self.checkpoint["favorites_complete"] = False
             for pid in validated_match_pids:
                 self.checkpoint["matched_by_pid"][pid] = True
@@ -133,22 +181,24 @@ class RunSink:
             self.checkpoint["reached_start"] = bool(payload.get("reached_start"))
             self.checkpoint["feed_exhausted"] = bool(payload.get("feed_exhausted"))
             self.checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
+            self.record_post_date(int(payload.get("oldest", 0)))
             self.last_progress = {
                 "page": end_page,
                 "pages": self.checkpoint["total_pages"],
                 "scanned": self.checkpoint["total_scanned"],
                 "matched": len(self.checkpoint["matched_by_pid"]),
-                "oldest": int(payload.get("oldest", 0)),
+                "oldest": self.checkpoint.get("oldest_post_timestamp", 0),
             }
             if payload.get("terminal"):
                 self.terminal_result = {
                     "reached_start": bool(payload.get("reached_start")),
                     "feed_exhausted": bool(payload.get("feed_exhausted")),
                 }
-            if payload.get("checkpoint") or payload.get("terminal"):
-                write_checkpoint(self.checkpoint_path, self.checkpoint)
+            self.last_chunk_digest = digest
             self.progress_sequence += 1
             self.condition.notify_all()
+            if payload.get("checkpoint") or payload.get("terminal"):
+                write_checkpoint(self.checkpoint_path, self.checkpoint)
 
     def flush(self) -> None:
         with self.lock:
@@ -159,7 +209,8 @@ class RunSink:
     ) -> tuple[int, dict | None]:
         with self.condition:
             self.condition.wait_for(
-                lambda: self.progress_sequence > after_sequence or process_done.is_set()
+                lambda: self.progress_sequence > after_sequence or process_done.is_set(),
+                timeout=0.25,
             )
             progress = dict(self.last_progress) if self.last_progress else None
             return self.progress_sequence, progress
@@ -175,13 +226,22 @@ class RunSink:
 
 class SinkServer:
     def __init__(self, sink: RunSink):
+        self.server_cancel = sink.cancel
         token = secrets.token_urlsafe(24)
         sink_ref = sink
 
         class Handler(BaseHTTPRequestHandler):
+            def handle(self) -> None:
+                try:
+                    super().handle()
+                except (ConnectionError, TimeoutError):
+                    # Closing/aborting a browser callback is normal on Windows,
+                    # including WinError 10053 during successful teardown.
+                    pass
+
             def _cors(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", SITE_ORIGIN)
-                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "content-type")
                 self.send_header("Access-Control-Allow-Private-Network", "true")
                 self.send_header("Access-Control-Max-Age", "3600")
@@ -190,6 +250,26 @@ class SinkServer:
                 self.send_response(204)
                 self._cors()
                 self.end_headers()
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                supplied = parse_qs(parsed.query).get("token", [""])[0]
+                if (parsed.path != "/control" or not hmac.compare_digest(supplied, token)
+                        or self.headers.get("Origin", "") != SITE_ORIGIN):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                # One event-driven cancellation connection, no browser polling.
+                sink_ref.cancel_event.wait()
+                body = b'{"cancelled":true}'
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
             def do_POST(self) -> None:
                 parsed = urlparse(self.path)
@@ -205,12 +285,13 @@ class SinkServer:
                     self.end_headers()
                     return
                 try:
+                    self.connection.settimeout(2)
                     length = int(self.headers.get("Content-Length", "0"))
                     if length <= 0 or length > 64 * 1024 * 1024:
                         raise CliError("Invalid local cache payload size.")
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                    sink_ref.ingest(payload)
-                    body = b'{"ok":true}'
+                    receipt = sink_ref.ingest(payload)
+                    body = json.dumps({"ok": True, **(receipt or {})}).encode("utf-8")
                     self.send_response(200)
                 except Exception as error:
                     body = json.dumps(
@@ -221,7 +302,10 @@ class SinkServer:
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
             def log_message(self, _format: str, *_args) -> None:
                 return
@@ -234,6 +318,8 @@ class SinkServer:
         self.url = f"http://127.0.0.1:{port}/ingest?{urlencode({'token': token})}"
 
     def close(self) -> None:
+        # Also releases a control request after normal completion.
+        self.server_cancel()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)

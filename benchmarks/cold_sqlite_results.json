@@ -1,0 +1,58 @@
+{
+  "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "sqlite": "3.45.1",
+  "storage": "/tmp",
+  "results": [
+    {
+      "kind": "posts",
+      "rows": 50000,
+      "batch_size": 500,
+      "repeats": 5,
+      "median_ms": 294.25,
+      "min_ms": 285.75,
+      "max_ms": 326.87,
+      "integrity": "ok"
+    },
+    {
+      "kind": "posts",
+      "rows": 50000,
+      "batch_size": 5000,
+      "repeats": 5,
+      "median_ms": 277.7,
+      "min_ms": 268.56,
+      "max_ms": 297.88,
+      "integrity": "ok"
+    },
+    {
+      "kind": "comments",
+      "rows": 10000,
+      "batch_size": 10,
+      "repeats": 5,
+      "median_ms": 182.57,
+      "min_ms": 175.69,
+      "max_ms": 186.25,
+      "integrity": "ok"
+    },
+    {
+      "kind": "comments",
+      "rows": 10000,
+      "batch_size": 100,
+      "repeats": 5,
+      "median_ms": 58.09,
+      "min_ms": 53.5,
+      "max_ms": 60.38,
+      "integrity": "ok"
+    },
+    {
+      "kind": "comments",
+      "rows": 10000,
+      "batch_size": 1000,
+      "repeats": 5,
+      "median_ms": 25.85,
+      "min_ms": 23.34,
+      "max_ms": 28.48,
+      "integrity": "ok"
+    }
+  ]
+}

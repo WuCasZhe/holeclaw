@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 
@@ -66,7 +67,8 @@ except ModuleNotFoundError:
 
 SITE_URL = "https://treehole.pku.edu.cn/ch/web/pc/index"
 CONFIG_KEY = "codex_pku_digest_config"
-PATH_ARGUMENTS = {"--state", "--cache", "--checkpoint", "--output"}
+PATH_ARGUMENTS = {"--state", "--cache", "--source-cache", "--checkpoint", "--output",
+                  "-s", "-C", "-S", "-k", "-o"}
 
 
 def codex_base() -> Path:
@@ -127,6 +129,13 @@ def windows_cli_arguments(arguments: list[str]) -> list[str]:
         if matched_option:
             _option, value = argument.split("=", 1)
             converted.append(f"{matched_option}={windows_native_path(value)}")
+            continue
+        # argparse also accepts attached short values, e.g. -o/tmp/report.json.
+        short_option = next((option for option in PATH_ARGUMENTS
+                             if len(option) == 2 and argument.startswith(option)
+                             and len(argument) > 2), None)
+        if short_option:
+            converted.extend([short_option, windows_native_path(argument[2:])])
             continue
         converted.append(argument)
         expecting_path = argument in PATH_ARGUMENTS
@@ -205,8 +214,7 @@ def find_pwcli() -> Path:
 
 
 def native_path(path: Path) -> str:
-    if is_wsl():
-        return windows_native_path(str(path))
+    # Windows-backed WSL launches are re-executed before reaching BrowserCli.
     return str(path.resolve())
 
 
@@ -346,12 +354,25 @@ def window_spec(args: argparse.Namespace) -> dict:
 
 def is_rolling_window(args: argparse.Namespace) -> bool:
     """Return true only when the window end moves with the current clock."""
-    return args.since is None and args.until is None
+    if args.until is None:
+        return True
+    requested_end = datetime.combine(
+        args.until + timedelta(days=1), dt_time.min, SHANGHAI
+    )
+    return requested_end > datetime.now(SHANGHAI)
 
 
 def should_reuse_checkpoint(args: argparse.Namespace, checkpoint: dict) -> bool:
     """Resume unfinished work, but never let a completed run freeze a rolling window."""
-    return not checkpoint.get("completed", False) or not is_rolling_window(args)
+    if not checkpoint.get("completed", False):
+        return True
+    if is_rolling_window(args):
+        return False
+    # A future --until may have been clipped to the clock on the previous run.
+    requested_end = int(datetime.combine(
+        args.until + timedelta(days=1), dt_time.min, SHANGHAI
+    ).timestamp())
+    return checkpoint.get("end_timestamp", requested_end) >= requested_end
 
 def report_profile(
     min_comments: int | None, min_favorites: int | None, match_mode: str
@@ -502,19 +523,43 @@ def run_standalone(args: argparse.Namespace) -> None:
     run_digest(args, standalone=True)
 
 
-def stop_collector_process(process: subprocess.Popen, timeout: float = 5) -> None:
-    if process.poll() is not None:
+def stop_collector_process(process: subprocess.Popen, timeout: float = 1) -> None:
+    if os.name == "nt":
+        if process.poll() is None:
+            # The browser already received cooperative cancellation. Kill the
+            # wrapper tree before its root can exit and orphan npx/Node children.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, timeout=3)
+        process.wait(timeout=timeout)
         return
     try:
-        if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            process.terminate()
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
         process.wait(timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # The group can outlive its leader, including a wrapper that exited early.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=timeout)
+
+
+def remaining_page_limit(
+    max_total_pages: int | None, completed_pages: int
+) -> int | None:
+    if max_total_pages is None:
+        return None
+    remaining = max_total_pages - completed_pages
+    if remaining <= 0:
+        raise CliError(
+            f"Reached --max-total-pages={max_total_pages} before the start time."
+        )
+    return remaining
 
 
 def run_persistent_collector(
@@ -524,12 +569,22 @@ def run_persistent_collector(
     sink: RunSink,
     sink_url: str,
 ) -> dict:
-    remaining = args.max_total_pages - checkpoint["total_pages"]
-    if remaining <= 0:
-        raise CliError(
-            f"Reached --max-total-pages={args.max_total_pages} before the start time."
-        )
+    cached_pages = checkpoint.get("archive_cached_pages", 0)
+    cached_remaining = max(0, cached_pages - checkpoint["next_page"] + 1)
+    remaining = (cached_remaining if checkpoint.get("archive_cache_only") else
+                 remaining_page_limit(args.max_total_pages, max(0, checkpoint["total_pages"] - cached_pages)))
+    if remaining is not None and not checkpoint.get("archive_cache_only"):
+        remaining += cached_remaining
     config = {
+        "archive": getattr(args, "archive", False),
+        "archive_run": checkpoint["created_at"],
+        "archive_cached_pages": checkpoint.get("archive_cached_pages", 0),
+        "archive_cache_only": checkpoint.get("archive_cache_only", False),
+        "comment_batch_pages": getattr(args, "comment_batch_pages", 10),
+        "comment_page_size": 100,
+        "extract_images": getattr(args, "extract_images", False),
+        "download_images": getattr(args, "download_images", False),
+        "control_url": sink_url.replace("/ingest?", "/control?"),
         "report_start_timestamp": checkpoint["start_timestamp"],
         "scan_start_timestamp": checkpoint["scan_start_timestamp"],
         "end_timestamp": checkpoint["end_timestamp"],
@@ -580,21 +635,26 @@ def run_persistent_collector(
         process_done.set()
         sink.wake_waiters()
 
-    output_thread = threading.Thread(target=collect_process_output)
+    output_thread = threading.Thread(target=collect_process_output, daemon=True)
     output_thread.start()
     progress_sequence = 0
     last_reported_pages = checkpoint["total_pages"]
-    progress_step = max(25, args.cache_chunk_pages)
+    progress_step = args.progress_pages
+    last_reported_at = time.monotonic()
     try:
         while True:
             progress_sequence, progress = sink.wait_for_progress(
                 progress_sequence, process_done
             )
-            if progress and progress["pages"] - last_reported_pages >= progress_step:
+            if (not getattr(args, "archive", False) and progress
+                    and progress["pages"] > last_reported_pages
+                    and (progress["pages"] - last_reported_pages >= progress_step
+                         or (args.progress_seconds and time.monotonic() - last_reported_at >= args.progress_seconds)
+                         or sink.result() is not None)):
                 oldest = progress.get("oldest", 0)
-                oldest_label = ""
+                oldest_label = " / 帖子最后日期：暂无"
                 if oldest:
-                    oldest_label = f" / 最旧 {datetime.fromtimestamp(oldest, SHANGHAI):%Y-%m-%d %H:%M}"
+                    oldest_label = f" / 帖子最后日期（最旧）：{datetime.fromtimestamp(oldest, SHANGHAI):%Y-%m-%d %H:%M}"
                 print(
                     f"进度：API 第 {progress['page']} 页"
                     f" / 累计 {progress['pages']} 页"
@@ -604,11 +664,15 @@ def run_persistent_collector(
                     flush=True,
                 )
                 last_reported_pages = progress["pages"]
+                last_reported_at = time.monotonic()
             if process_done.is_set():
                 break
-    except KeyboardInterrupt:
+    except BaseException:
+        sink.cancel()
+        # Let the browser abort fetches and timers before terminating the CLI tree.
+        process_done.wait(timeout=0.5)
         stop_collector_process(process)
-        output_thread.join(timeout=10)
+        output_thread.join(timeout=1)
         raise
 
     output_thread.join()
@@ -623,16 +687,24 @@ def run_persistent_collector(
     return data
 
 
+def validate_progress_arguments(args: argparse.Namespace) -> None:
+    if args.progress_pages < 1:
+        raise CliError('--progress-pages must be positive.')
+    if args.progress_seconds != 0 and args.progress_seconds < 10:
+        raise CliError('--progress-seconds must be 0 (disabled) or at least 10.')
+
+
 def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
     resolve_thresholds(args)
+    validate_progress_arguments(args)
     if args.checkpoint_pages <= 0 or args.checkpoint_pages > 500:
         raise CliError("--checkpoint-pages must be between 1 and 500.")
     if args.cache_chunk_pages <= 0 or args.cache_chunk_pages > 20:
         raise CliError("--cache-chunk-pages must be between 1 and 20.")
-    if args.max_total_pages <= 0 or args.max_total_pages > 5000:
-        raise CliError("--max-total-pages must be between 1 and 5000.")
-    if args.concurrency <= 0 or args.concurrency > 4:
-        raise CliError("--concurrency must be between 1 and 4.")
+    if args.max_total_pages is not None and args.max_total_pages <= 0:
+        raise CliError("--max-total-pages must be positive when specified.")
+    if args.concurrency <= 0 or args.concurrency > 8:
+        raise CliError("--concurrency must be between 1 and 8.")
     spec = window_spec(args)
     start_ts, end_ts, window_label = time_window(args)
     checkpoint_path = (args.checkpoint or default_checkpoint_path(spec)).resolve()
@@ -662,7 +734,7 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
             candidate = load_checkpoint(checkpoint_path, spec)
             if not should_reuse_checkpoint(args, candidate):
                 print(
-                    "已完成的滚动窗口检查点仅作为历史记录；"
+                    "已完成的检查点尚未覆盖当前请求窗口；"
                     "将按当前时间重新规划窗口并复用 SQLite 覆盖。",
                     flush=True,
                 )
@@ -812,8 +884,13 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         checkpoint["updated_at"] = datetime.now(SHANGHAI).isoformat()
         if not checkpoint["completed"]:
             sink.flush()
+            if args.max_total_pages is not None:
+                raise CliError(
+                    f"Reached --max-total-pages={args.max_total_pages} before the start time. "
+                    f"Checkpoint saved at {checkpoint_path}."
+                )
             raise CliError(
-                f"Reached --max-total-pages={args.max_total_pages} before the start time. "
+                "Collector stopped before the start time or feed exhaustion. "
                 f"Checkpoint saved at {checkpoint_path}."
             )
         checkpoint["completed_at"] = checkpoint["updated_at"]
@@ -857,71 +934,107 @@ def run_digest(args: argparse.Namespace, standalone: bool = False) -> None:
         cache.close()
 
 
-def add_digest_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--days", type=int, default=30)
-    parser.add_argument("--since", type=parse_date)
-    parser.add_argument("--until", type=parse_date)
+def add_digest_arguments(parser: argparse.ArgumentParser, *, archive: bool = False) -> None:
+    parser.add_argument("-d", "--days", type=int, default=None if archive else 30,
+                        help="最近 N 天（正整数）；归档默认全部可访问历史，报告默认 30 天；--since 优先")
+    parser.add_argument("-b", "--since", type=parse_date, help="起始日期 YYYY-MM-DD，包含当天，上海时区")
+    parser.add_argument("-e", "--until", type=parse_date, help="结束日期 YYYY-MM-DD，包含当天；默认当前时间")
     parser.add_argument(
-        "--min-comments", type=int, help="Require reply count to be strictly greater than N"
+        "-c", "--min-comments", type=int, help="评论数严格大于 N（非负）；报告未设任何阈值时默认 50，归档不设默认阈值"
     )
     parser.add_argument(
-        "--min-favorites", type=int, help="Require favorite count to be strictly greater than N"
+        "-f", "--min-favorites", type=int, help="收藏数严格大于 N（非负）；仅设收藏阈值时不附加评论筛选"
     )
     parser.add_argument(
-        "--match-mode",
+        "-m", "--match-mode",
         choices=("all", "any"),
         default="all",
-        help="Require all thresholds (AND) or any threshold (OR)",
+        help="多个阈值的关系：all 全部满足（默认），any 满足任一",
     )
-    parser.add_argument("--checkpoint-pages", type=int, default=100)
-    parser.add_argument("--cache-chunk-pages", type=int, default=1)
+    parser.add_argument("-K", "--checkpoint-pages", type=int, default=100,
+                        help="每 N 个列表页保存续传检查点（1–500，默认 100）；结束或中断时保存已提交进度")
+    parser.add_argument("-B", "--cache-chunk-pages", type=int, default=1,
+                        help="每 N 个列表页批量写入 SQLite（1–20，默认 1）；未提交页在中断后重扫")
+    parser.add_argument("-p", "--progress-pages", type=int, default=1,
+                        help="每新增 N 个已提交列表页输出进度（正整数，默认 1）；末尾不足 N 页也输出")
+    parser.add_argument("-t", "--progress-seconds", type=int, default=0,
+                        help="有新进展时额外按秒输出（0 关闭，默认 0；启用须 >=10）；评论采集耗时长时可设 120")
     parser.add_argument(
-        "--concurrency",
+        "-j", "--concurrency",
         type=int,
-        default=4,
-        help="Bounded Treehole request concurrency (1-4; default: 4)",
+        default=8,
+        help="树洞请求并发数（1–8，默认 8）；列表、详情、评论和图片共用上限，429 时自动降低",
     )
-    parser.add_argument("--max-total-pages", type=int, default=2000)
-    parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--cache", type=Path)
-    parser.add_argument("--fresh", action="store_true")
-    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "-n", "--max-total-pages",
+        type=int,
+        default=None,
+        help="本轮累计网络列表页上限（正整数，默认不限）；归档的缓存批次不占额度",
+    )
+    parser.add_argument("-k", "--checkpoint", type=Path, help="续传检查点路径；默认按时间窗口和筛选条件存入运行时目录")
+    parser.add_argument("-C", "--cache", type=Path, help="SQLite 路径；报告默认共享列表库，归档默认按账号隔离的档案库")
+    parser.add_argument("-F", "--fresh", action="store_true", help="忽略可复用覆盖和旧检查点，重新联网采集；不删除历史档案")
+    parser.add_argument("-o", "--output", type=Path, help="输出文件；报告默认 reports/ 下的 Markdown，归档指定后另存 JSON 摘要")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Low-frequency PKU Treehole digest collector")
-    parser.add_argument("--session", default="pku-hole-digest")
-    parser.add_argument("--state", type=Path, default=Path(".auth/pku-treehole.json"))
+    parser = argparse.ArgumentParser(description="北大树洞低频采集、报告与评论归档",
+                                     epilog="子命令参数说明：python3 scripts/run_digest.py <子命令> -h；全局参数放在子命令之前。",
+                                     allow_abbrev=False)
+    parser.add_argument("-l", "--session", default="pku-hole-digest", help="浏览器会话名（默认 pku-hole-digest）；放在子命令之前")
+    parser.add_argument("-s", "--state", type=Path, default=Path(".auth/pku-treehole.json"), help="登录状态文件（默认 .auth/pku-treehole.json）；放在子命令之前")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("login-open")
-    subparsers.add_parser("login-save")
-    add_digest_arguments(subparsers.add_parser("run"))
+    subparsers.add_parser("login-open", help="打开可见浏览器，供用户自行登录")
+    subparsers.add_parser("login-save", help="完成登录后保存本地登录状态")
+    add_digest_arguments(subparsers.add_parser("run", help="利用已有登录状态采集并生成报告", allow_abbrev=False))
     standalone_parser = subparsers.add_parser(
         "standalone",
-        help="Run without AI assistance and handle interactive login when needed",
+        help="独立运行，必要时等待交互登录", allow_abbrev=False,
     )
     add_digest_arguments(standalone_parser)
     standalone_parser.add_argument(
-        "--non-interactive",
+        "-y", "--non-interactive",
         action="store_true",
-        help="Fail instead of waiting for login; suitable for cron after initial setup",
+        help="无头运行，登录失效时直接报错；适合首次登录后的定时任务",
     )
+    archive_parser = subparsers.add_parser("archive", help="归档可访问帖子、评论及可选图片", allow_abbrev=False)
+    add_digest_arguments(archive_parser, archive=True)
+    archive_parser.set_defaults(days=None)
+    archive_parser.add_argument("-i", "--extract-images", action="store_true", help="保存帖子和评论的图片引用，不下载文件")
+    archive_parser.add_argument("-I", "--download-images", action="store_true", help="提取图片引用并下载原图到账号档案 images/ 目录")
+    archive_parser.add_argument("-a", "--account", required=True, help="必填：本地账号标签；不同登录账号使用不同标签")
+    archive_parser.add_argument("-y", "--non-interactive", action="store_true", help="无头运行，登录失效时直接报错，不等待用户登录")
+    archive_parser.add_argument("-S", "--source-cache", type=Path, help="可复用列表缓存路径；默认现有报告列表库，与档案库分开")
+    archive_parser.add_argument("-P", "--comment-batch-pages", type=int, default=10, help="每 N 个评论页提交一批（1–20，默认 10）；帖子结束时提交余量")
+    search_parser = subparsers.add_parser("archive-search", help="离线搜索本地档案，无需登录", allow_abbrev=False)
+    search_parser.add_argument("-C", "--cache", type=Path, required=True, help="必填：要搜索的 SQLite 档案库路径")
+    search_parser.add_argument("-q", "--query", required=True, help="必填：在帖子和评论正文中查找的关键词")
+    search_parser.add_argument("-n", "--limit", type=int, default=50, help="最多返回的结果条数（1–1000，默认 50）")
     return parser
 
 
 def main() -> None:
     try:
-        reexec_code = maybe_reexec_windows_runtime()
+        args = build_parser().parse_args()
+        reexec_code = None if args.command == "archive-search" else maybe_reexec_windows_runtime()
         if reexec_code is not None:
             raise SystemExit(reexec_code)
-        args = build_parser().parse_args()
         if args.command == "login-open":
             login_open(args)
         elif args.command == "login-save":
             login_save(args)
         elif args.command == "standalone":
             run_standalone(args)
+        elif args.command in ("archive", "archive-search"):
+            try:
+                from holeclaw_archive import run_archive, search_archive
+            except ModuleNotFoundError:
+                from scripts.holeclaw_archive import run_archive, search_archive
+            if args.command == "archive":
+                run_archive(args, sys.modules[__name__])
+            else:
+                search_archive(args)
         else:
             run_digest(args)
     except CliError as error:

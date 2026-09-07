@@ -17,24 +17,36 @@ async (page) => {
     match_mode: matchMode = 'all',
     start_page: startPage = 1,
     page_size: pageSize = 500,
-    max_pages: maxPages = 2000,
+    max_pages: maxPages = null,
     pages_before: pagesBefore = 0,
     checkpoint_pages: checkpointPages = 100,
-    cache_chunk_pages: cacheChunkPages = 5,
-    request_concurrency: requestConcurrency = 4,
+    cache_chunk_pages: cacheChunkPages = 1,
+    request_concurrency: requestConcurrency = 8,
     delay_min_ms: delayMinMs = 600,
     delay_max_ms: delayMaxMs = 2000,
     sink_url: sinkUrl,
+    archive: archive = false,
+    archive_run: archiveRun = null,
+    archive_cached_pages: archiveCachedPages = 0,
+    archive_cache_only: archiveCacheOnly = false,
+    comment_batch_pages: commentBatchPages = 10,
+    comment_page_size: commentPageSize = 100,
+    extract_images: extractImages = false,
+    download_images: downloadImages = false,
+    control_url: controlUrl = null,
   } = config;
   if (!(reportStartTimestamp <= scanStartTimestamp && scanStartTimestamp < endTimestamp)) {
     throw new Error('Invalid time window.');
   }
   if (
+    (controlUrl !== null && controlUrl !== sinkUrl.replace('/ingest?', '/control?')) ||
+    !Number.isInteger(commentBatchPages) || commentBatchPages < 1 || commentBatchPages > 20 ||
+    commentPageSize !== 100 ||
+    !Number.isInteger(archiveCachedPages) || archiveCachedPages < 0 ||
     !Number.isInteger(startPage) ||
     startPage < 1 ||
-    !Number.isInteger(maxPages) ||
-    maxPages < 1 ||
-    maxPages > 5000 ||
+    (maxPages !== null &&
+      (!Number.isSafeInteger(maxPages) || maxPages < 1)) ||
     !Number.isInteger(checkpointPages) ||
     checkpointPages < 1 ||
     checkpointPages > 500 ||
@@ -43,7 +55,7 @@ async (page) => {
     cacheChunkPages > 20 ||
     !Number.isInteger(requestConcurrency) ||
     requestConcurrency < 1 ||
-    requestConcurrency > 4 ||
+    requestConcurrency > 8 ||
     pageSize !== 500 ||
     delayMinMs !== 600 ||
     delayMaxMs !== 2000 ||
@@ -55,7 +67,7 @@ async (page) => {
       (!Number.isInteger(minFavorites) || minFavorites < 0)) ||
     !['all', 'any'].includes(matchMode) ||
     (matchMode === 'any' && (minComments === null || minFavorites === null)) ||
-    (minComments === null && minFavorites === null)
+    (!archive && minComments === null && minFavorites === null)
   ) {
     throw new Error('Unsafe request configuration.');
   }
@@ -77,6 +89,15 @@ async (page) => {
 
   return await page.evaluate(
       async ({
+        archive,
+        archiveRun,
+        archiveCachedPages,
+        archiveCacheOnly,
+        commentBatchPages,
+        commentPageSize,
+        extractImages,
+        downloadImages,
+        controlUrl,
         endpoint,
         authHeaders,
         reportStartTimestamp,
@@ -96,12 +117,31 @@ async (page) => {
         delayMaxMs,
         sinkUrl,
       }) => {
-        const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+        const controller = new AbortController();
+        const controlController = new AbortController();
+        let finished = false;
+        let settleWork = async () => {};
+        const controlRequest = controlUrl ? fetch(controlUrl, { signal: controlController.signal })
+          .then(async (response) => {
+            if (!response.ok || JSON.parse(await response.text()).cancelled) controller.abort();
+          }).catch(() => { if (!finished) controller.abort(); }) : null;
+        try {
+        const sleep = (milliseconds) => new Promise((resolve, reject) => {
+          const signal = controller.signal;
+          if (signal.aborted) { reject(new Error('Collector cancelled.')); return; }
+          let timer;
+          const abort = () => { clearTimeout(timer); reject(new Error('Collector cancelled.')); };
+          signal.addEventListener('abort', abort, { once: true });
+          timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, milliseconds);
+        });
         const jitter = () =>
           delayMinMs + Math.floor(Math.random() * (delayMaxMs - delayMinMs + 1));
         const newTelemetry = () => ({
           list_requests: 0,
           detail_requests: 0,
+          comment_requests: 0,
+          image_requests: 0,
+          image_bytes: 0,
           request_ms: 0,
           pacing_ms: 0,
           retry_backoff_ms: 0,
@@ -112,8 +152,13 @@ async (page) => {
           max_in_flight: 0,
           overfetch_pages: 0,
         });
-        let chunkTelemetry = newTelemetry();
-        let chunkWallStartedAt = performance.now();
+        const chunkTelemetry = newTelemetry();
+        let reportedTelemetry = newTelemetry();
+        const wallStartedAt = performance.now();
+        const telemetrySnapshot = () => ({...chunkTelemetry,
+          wall_ms: Math.max(0, Math.round(performance.now() - wallStartedAt))});
+        const telemetryDelta = (snapshot) => Object.fromEntries(Object.entries(snapshot)
+          .map(([key, value]) => [key, key === 'max_in_flight' ? value : value - reportedTelemetry[key]]));
         let activeRequests = 0;
         let cooldownUntil = 0;
         let effectiveConcurrency = requestConcurrency;
@@ -140,65 +185,131 @@ async (page) => {
           return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : 0;
         };
 
-        const requestJson = async (url, label) => {
+        // Share permits across list prefetch, detail workers and retries.
+        let occupiedSlots = 0;
+        const requestWaiters = [];
+        controller.signal.addEventListener('abort', () => {
+          while (requestWaiters.length) requestWaiters.shift()();
+        });
+        const grantRequestSlots = () => {
+          while (requestWaiters.length && occupiedSlots < effectiveConcurrency) {
+            occupiedSlots += 1;
+            requestWaiters.shift()();
+          }
+        };
+        const acquireRequestSlot = async () => {
+          while (true) {
+            controller.signal.throwIfAborted();
+            await waitForSharedCooldown();
+            await new Promise((resolve) => {
+              requestWaiters.push(resolve);
+              grantRequestSlots();
+            });
+            controller.signal.throwIfAborted();
+            // A throttle may arrive while queued. Do not hold a stale permit
+            // through its cooldown and then exceed the reduced concurrency.
+            if (cooldownUntil <= Date.now() && occupiedSlots <= effectiveConcurrency) return;
+            releaseRequestSlot();
+          }
+        };
+        const releaseRequestSlot = () => {
+          occupiedSlots -= 1;
+          grantRequestSlots();
+        };
+
+        const requestJson = async (url, label, binary = false, allowMissing = false) => {
           let result = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
-            await waitForSharedCooldown();
-            const startedAt = performance.now();
-            const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
-            chunkTelemetry[requestCounter] += 1;
-            activeRequests += 1;
-            chunkTelemetry.max_in_flight = Math.max(
-              chunkTelemetry.max_in_flight,
-              activeRequests,
-            );
+            await acquireRequestSlot();
             try {
-              const response = await fetch(url, { headers: authHeaders });
-              const text = await response.text();
-              chunkTelemetry.response_chars += text.length;
-              let json = null;
+              const startedAt = performance.now();
+              const requestCounter = label.startsWith('list ') ? 'list_requests' : 'detail_requests';
+              chunkTelemetry[requestCounter] += 1;
+              if (binary) chunkTelemetry.image_requests += 1;
+              if (label.startsWith('detail comments ')) chunkTelemetry.comment_requests += 1;
+              activeRequests += 1;
+              chunkTelemetry.max_in_flight = Math.max(
+                chunkTelemetry.max_in_flight,
+                activeRequests,
+              );
               try {
-                json = JSON.parse(text);
-              } catch {
-                // Report a short preview only; never expose request headers.
+                const response = await fetch(url, { headers: authHeaders, signal: controller.signal });
+                if (binary && response.status === 200 && !response.headers.get('content-type')?.includes('json')) {
+                  const reader = response.body.getReader();
+                  const chunks = [];
+                  let size = 0;
+                  while (true) {
+                    controller.signal.throwIfAborted();
+                    const {value, done} = await reader.read();
+                    if (done) break;
+                    size += value.length;
+                    if (size > 20 * 1024 * 1024) {
+                      await reader.cancel();
+                      throw Object.assign(new Error('Image exceeds the 20 MiB limit.'), {permanent: true});
+                    }
+                    chunks.push(value);
+                  }
+                  let raw = '';
+                  for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 8192) {
+                    raw += String.fromCharCode(...chunk.subarray(i, i + 8192));
+                  }
+                  chunkTelemetry.image_bytes += size;
+                  result = {status: 200, file: {data: btoa(raw), mime: response.headers.get('content-type') || ''}};
+                } else {
+                const text = await response.text();
+                chunkTelemetry.response_chars += text.length;
+                let json = null;
+                try {
+                  json = JSON.parse(text);
+                } catch {
+                  // Report a short preview only; never expose request headers.
+                }
+                result = {
+                  status: response.status,
+                  retryAfter: response.headers.get('retry-after'),
+                  json,
+                  preview: json ? '' : text.slice(0, 80),
+                };
+                }
+              } catch (error) {
+                controller.signal.throwIfAborted();
+                if (error.permanent) throw error;
+                result = {
+                  status: 0,
+                  retryAfter: null,
+                  json: null,
+                  preview: error?.name || 'NetworkError',
+                };
+              } finally {
+                activeRequests -= 1;
+                chunkTelemetry.request_ms += Math.max(0, Math.round(performance.now() - startedAt));
               }
-              result = {
-                status: response.status,
-                retryAfter: response.headers.get('retry-after'),
-                json,
-                preview: json ? '' : text.slice(0, 80),
-              };
-            } catch (error) {
-              result = {
-                status: 0,
-                retryAfter: null,
-                json: null,
-                preview: error?.name || 'NetworkError',
-              };
-            } finally {
-              activeRequests -= 1;
-              chunkTelemetry.request_ms += Math.max(0, Math.round(performance.now() - startedAt));
-            }
 
-            const transient =
-              result.status === 0 || result.status === 429 || result.status >= 500;
-            if (result.status === 429) {
-              chunkTelemetry.throttle_responses += 1;
-              if (effectiveConcurrency > 1) {
-                effectiveConcurrency -= 1;
-                chunkTelemetry.concurrency_reductions += 1;
+              const transient =
+                result.status === 0 || result.status === 429 || result.status >= 500;
+              if (result.status === 429) {
+                chunkTelemetry.throttle_responses += 1;
+                if (effectiveConcurrency > 1) {
+                  effectiveConcurrency -= 1;
+                  chunkTelemetry.concurrency_reductions += 1;
+                }
               }
+              if (!transient || attempt === 2) break;
+              const serverDelay = retryAfterMilliseconds(result.retryAfter);
+              const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
+              const backoffMilliseconds = Math.min(60_000, backoff);
+              cooldownUntil = Math.max(cooldownUntil, Date.now() + backoffMilliseconds);
+            } finally {
+              releaseRequestSlot();
             }
-            if (!transient || attempt === 2) break;
-            const serverDelay = retryAfterMilliseconds(result.retryAfter);
-            const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
-            const backoffMilliseconds = Math.min(60_000, backoff);
-            cooldownUntil = Math.max(cooldownUntil, Date.now() + backoffMilliseconds);
           }
           if (result.status === 401 || result.status === 403) {
             throw new Error(`Authentication expired while loading ${label} (${result.status}).`);
           }
-          if (result.status !== 200 || result.json?.code !== 20000) {
+          if (allowMissing && (result.json?.code === 41001 || [404, 410].includes(result.status))) return {unavailable: true};
+          if (binary && ([404, 410].includes(result.status) || result.json?.code === 41001)) return {status: 'unavailable'};
+          if (binary && result.file) return result.file;
+          if (binary || result.status !== 200 || result.json?.code !== 20000) {
             throw new Error(
               `${label} failed: HTTP ${result.status}, code ${result.json?.code}, ${result.preview}`,
             );
@@ -221,6 +332,8 @@ async (page) => {
           await Promise.all(runners);
         };
 
+        const mediaIds = (raw) => raw == null || raw === '' ? [] : (Array.isArray(raw) ? raw : String(raw).split(',')).map(String).map(x => x.trim()).filter(Boolean);
+
         const nonNegativeInteger = (rawValue, fallback = null) => {
           if (rawValue === null || rawValue === undefined || rawValue === '') return fallback;
           const value = Number(rawValue);
@@ -228,17 +341,21 @@ async (page) => {
         };
 
         const sendToSink = async (payload) => {
+          // Freeze the body: in-flight prefetch may update telemetry during retry.
+          const body = JSON.stringify(payload);
           let lastError = null;
           for (let attempt = 0; attempt < 3; attempt += 1) {
             try {
               const response = await fetch(sinkUrl, {
+                signal: controller.signal,
                 method: 'POST',
                 headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-                body: JSON.stringify(payload),
+                body,
               });
-              if (response.ok) return;
+              if (response.ok) return JSON.parse(await response.text());
               lastError = new Error(`Local cache sink returned HTTP ${response.status}.`);
             } catch (error) {
+              controller.signal.throwIfAborted();
               lastError = error;
             }
             await sleep(250 * 2 ** attempt);
@@ -264,21 +381,46 @@ async (page) => {
           return matchMode === 'any' ? conditions.some(Boolean) : conditions.every(Boolean);
         };
 
-        const pageLimit = startPage + maxPages;
+        const hasPageLimit = maxPages !== null;
+        const pageLimit = archiveCacheOnly ? archiveCachedPages + 1 : hasPageLimit
+          ? startPage + maxPages
+          : Number.POSITIVE_INFINITY;
         const maxBufferedPages = Math.max(requestConcurrency * 2, requestConcurrency);
         const pageBuffer = new Map();
         const inFlightPages = new Map();
         let nextPageToFetch = startPage;
         let stopScheduling = false;
+        // Probe the first remote page in both modes before expanding lookahead.
+        let archiveScheduleThrough = Math.max(startPage, archiveCachedPages + 1);
+        let archiveStopPage = Number.POSITIVE_INFINITY;
 
         const launchListPage = (pageNumber) => {
           const tracked = (async () => {
+            if (archive && pageNumber <= archiveCachedPages) {
+              const cached = await sendToSink({schema_version: 2, archive_source: true,
+                archive_run: archiveRun, page: pageNumber});
+              if (!Array.isArray(cached.posts)) throw new Error('Invalid cached post batch.');
+              return { posts: cached.posts };
+            }
             await pacingSleep();
             const listJson = await requestJson(
-              `${endpoint}?page=${pageNumber}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
+              `${endpoint}?page=${pageNumber - archiveCachedPages}&limit=${pageSize}&comment_limit=0&comment_stream=1`,
               `list page ${pageNumber}`,
             );
-            return { pageNumber, posts: listJson?.data?.list || [] };
+            const posts = listJson?.data?.list;
+            if (!Array.isArray(posts)) throw new Error(`Invalid post list on page ${pageNumber}`);
+            {
+              const newest = Number(posts[0]?.timestamp || 0);
+              const oldest = Number(posts.at(-1)?.timestamp || 0);
+              if (!posts.length || (oldest && oldest < scanStartTimestamp)) {
+                archiveStopPage = Math.min(archiveStopPage, pageNumber);
+              } else {
+                const estimatedPages = Math.floor((oldest - scanStartTimestamp) / Math.max(1, newest - oldest));
+                archiveScheduleThrough = Math.max(archiveScheduleThrough,
+                  pageNumber + Math.min(requestConcurrency, Math.max(1, estimatedPages)));
+              }
+            }
+            return { pageNumber, posts };
           })()
             .then(
               (result) => pageBuffer.set(pageNumber, result),
@@ -293,6 +435,7 @@ async (page) => {
             !stopScheduling &&
             inFlightPages.size < effectiveConcurrency &&
             nextPageToFetch < pageLimit &&
+            nextPageToFetch <= archiveScheduleThrough && nextPageToFetch <= archiveStopPage &&
             inFlightPages.size + pageBuffer.size < maxBufferedPages
           ) {
             const pageNumber = nextPageToFetch;
@@ -312,23 +455,44 @@ async (page) => {
           }
           const result = pageBuffer.get(pageNumber);
           pageBuffer.delete(pageNumber);
-          fillListRequestSlots();
           if (result.error) throw result.error;
           return result;
         };
 
-        while (pages < maxPages && !reachedStart && !feedExhausted) {
-            const pageNumber = startPage + pages;
-            const { posts } = await takeListPageInOrder(pageNumber);
-            pages += 1;
-            scanned += posts.length;
-            chunkScanned += posts.length;
+        // Share post workers across a bounded window of list pages. Duplicate
+        // PIDs are serialized so two snapshots cannot race their comment cursor.
+        const postQueue = [];
+        const postWorkByPid = new Map();
+        let activePostWorkers = 0;
+        let nextMediaPlan = 0;
+        const drainPostQueue = () => {
+          while (postQueue.length && activePostWorkers < effectiveConcurrency) {
+            const {worker, resolve, reject} = postQueue.shift();
+            activePostWorkers += 1;
+            Promise.resolve().then(() => {
+              controller.signal.throwIfAborted();
+              return worker();
+            }).then(resolve, reject).finally(() => {
+              activePostWorkers -= 1;
+              drainPostQueue();
+            });
+          }
+        };
+        const schedulePost = (pid, worker) => {
+          const previous = postWorkByPid.get(pid) || Promise.resolve();
+          const work = previous.then(() => new Promise((resolve, reject) => {
+            postQueue.push({worker, resolve, reject});
+            drainPostQueue();
+          }));
+          postWorkByPid.set(pid, work);
+          const forget = () => { if (postWorkByPid.get(pid) === work) postWorkByPid.delete(pid); };
+          work.then(forget, forget);
+          return work;
+        };
 
-            if (!posts.length) {
-              feedExhausted = true;
-              reachedStart = true;
-            }
-
+        const processListPage = async (posts, cachedPage) => {
+            const pendingRows = [];
+            const pendingUnavailableByPid = new Map();
             const rowsByPid = new Map();
             const detailsFetchedPids = new Set();
             for (const post of posts) {
@@ -339,6 +503,7 @@ async (page) => {
                 favorites: nonNegativeInteger(post.likenum),
                 type: post.type || 'text',
                 text: post.text || '',
+                ...(extractImages && Object.hasOwn(post, 'media_ids') ? {media_ids: mediaIds(post.media_ids)} : {}),
               };
               rowsByPid.set(row.pid, row);
               pendingRows.push(row);
@@ -351,6 +516,7 @@ async (page) => {
                 `detail #${post.pid}`,
               );
               const hole = detailJson?.data?.hole || {};
+              if (extractImages) post.media_ids = mediaIds(hole.media_ids);
               post.text = hole.text || post.text;
               post.type = hole.type || post.type;
               post.reply = Number(hole.reply ?? post.reply);
@@ -365,7 +531,8 @@ async (page) => {
             };
 
             const missingFavorites = [...rowsByPid.values()].filter(
-              (post) => minFavorites !== null && post.favorites === null,
+              (post) => !cachedPage && minFavorites !== null && post.favorites === null
+                && post.timestamp >= reportStartTimestamp && post.timestamp < endTimestamp,
             );
             await mapLimit(missingFavorites, effectiveConcurrency, async (post) => {
               await fetchAndApplyDetail(post, null);
@@ -387,11 +554,178 @@ async (page) => {
               await fetchAndApplyDetail(post, post.favorites);
             });
             pageMatches = pageMatches.filter(matchesThresholds);
-            for (const post of pageMatches) pendingMatchedPids.add(post.pid);
+            if (archive) {
+              const prepared = pageMatches.length ? await sendToSink({
+                schema_version: 2, archive_prepare: true, archive_run: archiveRun, posts: pageMatches,
+              }) : {resumes: {}};
+              // One resume lookup per post batch, then bounded comment chunks.
+              await Promise.all(pageMatches.map((post) => schedulePost(post.pid, async () => {
+                const resume = prepared.resumes?.[post.pid];
+                if (!resume) throw new Error(`Missing archive resume state for #${post.pid}`);
+                if (extractImages && resume.unavailable) return;
+                if (extractImages && (!resume.post_known || Object.hasOwn(post, 'media_ids'))) {
+                  if (!Object.hasOwn(post, 'media_ids')) {
+                    await pacingSleep();
+                    const detail = await requestJson(`/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`, `detail image metadata #${post.pid}`, false, true);
+                    if (detail.unavailable) {
+                      await sendToSink({schema_version: 2, archive_media_unavailable: true, archive_run: archiveRun, post});
+                      return;
+                    }
+                    if (!detail?.data?.hole) throw new Error(`Missing image metadata for #${post.pid}`);
+                    post.media_ids = mediaIds(detail.data.hole.media_ids);
+                  }
+                  await sendToSink({schema_version: 2, archive_post_media: true, archive_run: archiveRun, post});
+                }
+                if (!resume.complete) {
+                const seen = new Set();
+                const collected = new Set(resume.saved_comment_ids || []);
+                const maxComments = 1000;
+                let pendingComments = [];
+                let batchPages = 0;
+                for (let commentPage = resume.next_page || 1; ; commentPage += 1) {
+                  const alreadyCapped = collected.size >= maxComments;
+                  if (post.reply !== 0 && !alreadyCapped) await pacingSleep();
+                  const data = post.reply === 0 || alreadyCapped ? {data: {list: []}} : await requestJson(
+                    `/chapi/api/v3/comment/list?pid=${encodeURIComponent(post.pid)}&page=${commentPage}&limit=${commentPageSize}&sort=0&comment_stream=1`,
+                    `detail comments #${post.pid} page ${commentPage}`, false, extractImages,
+                  );
+                  if (data.unavailable) {
+                    await sendToSink({schema_version: 2, archive_media_unavailable: true, archive_run: archiveRun, post});
+                    return;
+                  }
+                  const comments = data?.data?.list;
+                  if (!Array.isArray(comments)) throw new Error(`Invalid comment list for #${post.pid}`);
+                  const rows = comments.map((comment) => {
+                    if (comment.cid === undefined || comment.cid === null || String(comment.cid) === '') {
+                      throw new Error(`Missing comment ID for #${post.pid}`);
+                    }
+                    return {
+                      cid: String(comment.cid), text: comment.text || '',
+                      timestamp: Number(comment.timestamp || 0),
+                      name_tag: String(comment.name_tag || ''),
+                      quote_cid: comment.quote?.cid == null ? null : String(comment.quote.cid),
+                      ...(extractImages ? {media_ids: mediaIds(comment.media_ids)} : {}),
+                    };
+                  });
+                  if (rows.length && rows.every((row) => seen.has(row.cid))) {
+                    throw new Error(`Comment pagination made no progress for #${post.pid}`);
+                  }
+                  for (const row of rows) seen.add(row.cid);
+                  for (const row of rows) {
+                    if (!collected.has(row.cid) && collected.size >= maxComments) break;
+                    collected.add(row.cid);
+                    pendingComments.push(row);
+                  }
+                  const complete = !comments.length || collected.size >= maxComments;
+                  batchPages += 1;
+                  if (batchPages >= commentBatchPages || complete) {
+                    await sendToSink({
+                      schema_version: 2, archive_comments: true, post,
+                      archive_run: archiveRun,
+                      comment_page: commentPage, comment_page_size: commentPageSize, comments: pendingComments,
+                      complete,
+                    });
+                    pendingComments = [];
+                    batchPages = 0;
+                  }
+                  if (complete) break;
+                }
+                }
+                if (downloadImages) {
+                  while (true) {
+                    const planned = await sendToSink({schema_version: 2, archive_media_plan: true,
+                      plan_id: String(++nextMediaPlan), archive_run: archiveRun, post});
+                    if (!planned.images?.length) break;
+                    await mapLimit(planned.images, effectiveConcurrency, async (item) => {
+                      await pacingSleep();
+                      const file = await requestJson(item.url, `image ${item.media_key}`, true);
+                      await sendToSink({schema_version: 2, archive_media_file: true, archive_run: archiveRun,
+                        post, media_key: item.media_key, ...file});
+                    });
+                  }
+                }
+              })));
+            }
+            return {rows: pendingRows, matches: archive ? [] : pageMatches.map(post => post.pid),
+              unavailable: [...pendingUnavailableByPid.values()]};
+        };
 
+        const processingPages = new Map();
+        const pipelineWaiters = [];
+        const wakePipeline = () => { while (pipelineWaiters.length) pipelineWaiters.shift()(); };
+        const waitForPipeline = () => new Promise(resolve => pipelineWaiters.push(resolve));
+        controller.signal.addEventListener('abort', wakePipeline, {once: true});
+        const recentFingerprints = [];
+        let producerDone = false;
+        let pageFailure = false;
+        let producerPageNumber = startPage;
+        const producer = (async () => {
+          for (; producerPageNumber < pageLimit; producerPageNumber += 1) {
+            const pageNumber = producerPageNumber;
+            while (processingPages.size >= (archive ? requestConcurrency : 1)) {
+              controller.signal.throwIfAborted();
+              await waitForPipeline();
+            }
+            controller.signal.throwIfAborted();
+            if (pageFailure) break;
+            const cachedPage = archive && pageNumber <= archiveCachedPages;
+            const {posts} = await takeListPageInOrder(pageNumber);
+            controller.signal.throwIfAborted();
+            // Exact PID-set repeats/cycles are abnormal; partial overlap is normal
+            // on a changing feed. Keep only a bounded recent-page window.
+            if (!cachedPage && posts.length) {
+              const fingerprint = JSON.stringify([...new Set(posts.map(post => String(post.pid)))].sort());
+              if (recentFingerprints.includes(fingerprint)) {
+                throw new Error(`List pagination made no progress on page ${pageNumber}`);
+              }
+              recentFingerprints.push(fingerprint);
+              if (recentFingerprints.length > 32) recentFingerprints.shift();
+            }
             const oldest = Number(posts.at(-1)?.timestamp || 0);
-            if (oldest && oldest < scanStartTimestamp) reachedStart = true;
-            const terminal = reachedStart || feedExhausted || pages === maxPages;
+            const exhausted = !posts.length;
+            const reached = exhausted || (!cachedPage && oldest > 0 && oldest < scanStartTimestamp)
+              || (archiveCacheOnly && pageNumber === archiveCachedPages);
+            const terminal = reached || pageNumber + 1 === pageLimit;
+            if (terminal) stopScheduling = true;
+            const work = processListPage(posts, cachedPage).then(
+              result => ({...result, cachedPage, oldest, scanned: posts.length,
+                reachedStart: reached, feedExhausted: exhausted, terminal}),
+              error => { pageFailure = true; stopScheduling = true; wakePipeline(); return {error}; });
+            processingPages.set(pageNumber, work);
+            wakePipeline();
+            if (terminal) break;
+          }
+        })().catch(error => {
+          // Deliver discovery errors after earlier pages have committed.
+          processingPages.set(producerPageNumber, Promise.resolve({error}));
+          stopScheduling = true;
+        }).finally(() => { producerDone = true; wakePipeline(); });
+        settleWork = async () => {
+          wakePipeline();
+          await producer;
+          await Promise.all([...processingPages.values()]);
+          await Promise.allSettled([...postWorkByPid.values()]);
+          await Promise.all([...inFlightPages.values()]);
+        };
+
+        while (true) {
+            const pageNumber = startPage + pages;
+            while (!processingPages.has(pageNumber)) {
+              controller.signal.throwIfAborted();
+              if (producerDone) throw new Error(`No processed page ${pageNumber}.`);
+              await waitForPipeline();
+            }
+            const result = await processingPages.get(pageNumber);
+            if (result.error) throw result.error;
+            const {cachedPage, oldest, terminal} = result;
+            pages += 1;
+            scanned += result.scanned;
+            chunkScanned += result.scanned;
+            pendingRows.push(...result.rows);
+            for (const pid of result.matches) pendingMatchedPids.add(pid);
+            for (const row of result.unavailable) pendingUnavailableByPid.set(row.pid, row);
+            reachedStart = result.reachedStart;
+            feedExhausted = result.feedExhausted;
             if (terminal) {
               stopScheduling = true;
               await Promise.all([...inFlightPages.values()]);
@@ -404,41 +738,64 @@ async (page) => {
               (pagesBefore + pages) % checkpointPages === 0 || terminal;
             const chunkFull = pages % cacheChunkPages === 0;
 
-            if (chunkFull || terminal || checkpoint) {
-              chunkTelemetry.wall_ms = Math.max(
-                0,
-                Math.round(performance.now() - chunkWallStartedAt),
-              );
+            // Cached candidate batches and network rows have different payload shapes.
+            // Never let a multi-page cache chunk straddle that boundary.
+            const cacheBoundary = cachedPage && pageNumber === archiveCachedPages;
+            if (chunkFull || terminal || checkpoint || cacheBoundary) {
+              const snapshot = telemetrySnapshot();
               await sendToSink({
                 schema_version: 2,
+                archive_cached: cachedPage,
                 start_page: chunkStartPage,
                 end_page: pageNumber,
                 pages: pageNumber - chunkStartPage + 1,
-                scanned: chunkScanned,
+                scanned: cachedPage ? 0 : chunkScanned,
                 oldest,
                 reached_start: reachedStart,
                 feed_exhausted: feedExhausted,
                 checkpoint,
                 terminal,
-                rows: pendingRows,
+                rows: cachedPage ? [] : pendingRows,
                 matched_pids: [...pendingMatchedPids],
-                favorite_unavailable: [...pendingUnavailableByPid.values()],
-                telemetry: chunkTelemetry,
+                favorite_unavailable: cachedPage ? [] : [...pendingUnavailableByPid.values()],
+                telemetry: telemetryDelta(snapshot),
               });
               chunkStartPage = pageNumber + 1;
               chunkScanned = 0;
               pendingRows = [];
               pendingMatchedPids = new Set();
               pendingUnavailableByPid = new Map();
-              chunkTelemetry = newTelemetry();
-              chunkWallStartedAt = performance.now();
+              reportedTelemetry = snapshot;
             }
+            processingPages.delete(pageNumber);
+            wakePipeline();
             if (terminal) break;
         }
 
+        // Account for requests completed during callbacks and the final data
+        // callback itself. This receipt changes no page/checkpoint positions.
+        await sendToSink({schema_version: 2, telemetry_final: true,
+          telemetry: telemetryDelta(telemetrySnapshot())});
+
         return null;
+        } finally {
+          finished = true;
+          controller.abort();
+          controlController.abort();
+          await settleWork();
+          if (controlRequest) await controlRequest;
+        }
       },
       {
+        archive,
+        archiveRun,
+        archiveCachedPages,
+        archiveCacheOnly,
+        commentBatchPages,
+        commentPageSize,
+        extractImages,
+        downloadImages,
+        controlUrl,
         endpoint,
         authHeaders,
         reportStartTimestamp,

@@ -17,6 +17,8 @@ except ModuleNotFoundError:
 
 
 class CacheStore:
+    allow_archive = False
+
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -29,6 +31,10 @@ class CacheStore:
                     schema_row = inspection.execute(
                         "SELECT value FROM metadata WHERE key='schema_version'"
                     ).fetchone()
+                    if not self.allow_archive and inspection.execute(
+                        "SELECT 1 FROM metadata WHERE key='archive_account'"
+                    ).fetchone():
+                        raise CliError("This is an archive database. Use a separate digest --cache path.")
                 finally:
                     inspection.close()
                 schema_version = int(schema_row[0]) if schema_row else 0
@@ -43,8 +49,10 @@ class CacheStore:
                     f"v{CACHE_SCHEMA_VERSION}: {self.path}. Use a new cache path."
                 )
         self.lock = threading.RLock()
-        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        self.connection = sqlite3.connect(self.path, check_same_thread=False, timeout=30, uri=True)
         self.connection.row_factory = sqlite3.Row
+        # Enter Python periodically during long SQLite work so Ctrl+C is delivered.
+        self.connection.set_progress_handler(lambda: 0, 1000)
         with self.lock:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=NORMAL")
@@ -130,7 +138,7 @@ class CacheStore:
         with self.lock:
             try:
                 yield
-            except Exception:
+            except BaseException:
                 self.connection.rollback()
                 raise
             else:
@@ -270,39 +278,38 @@ class CacheStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def find_covering(
-        self, start_ts: int, end_ts: int, require_favorites: bool = False
-    ) -> dict | None:
-        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
+    def _coverage_from(self, start_ts, require_favorites=False):
+        """Union contiguous verified intervals, preserving gaps and favorite coverage."""
+        clause = 'WHERE favorites_complete=1' if require_favorites else ''
         with self.lock:
-            row = self.connection.execute(
-                f"""
-                SELECT * FROM coverage
-                WHERE start_timestamp <= ? AND end_timestamp >= ?
-                {favorites_clause}
-                ORDER BY end_timestamp DESC, completed_at DESC
-                LIMIT 1
-                """,
-                (start_ts, end_ts),
-            ).fetchone()
-        return dict(row) if row else None
+            rows = self.connection.execute(
+                f'SELECT * FROM coverage {clause} ORDER BY start_timestamp,end_timestamp').fetchall()
+        merged = None
+        for raw in rows:
+            row = dict(raw)
+            if row['end_timestamp'] <= start_ts:
+                continue
+            if merged is None:
+                if row['start_timestamp'] > start_ts:
+                    break
+                merged = row
+            elif row['start_timestamp'] > merged['end_timestamp']:
+                break
+            elif row['end_timestamp'] > merged['end_timestamp']:
+                merged['end_timestamp'] = row['end_timestamp']
+                merged['completed_at'] = max(merged['completed_at'], row['completed_at'])
+                merged['source_pages'] += row['source_pages']
+                merged['source_scanned'] += row['source_scanned']
+                merged['favorites_complete'] &= row['favorites_complete']
+        return merged
 
-    def find_prefix(
-        self, start_ts: int, end_ts: int, require_favorites: bool = False
-    ) -> dict | None:
-        favorites_clause = "AND favorites_complete = 1" if require_favorites else ""
-        with self.lock:
-            row = self.connection.execute(
-                f"""
-                SELECT * FROM coverage
-                WHERE start_timestamp <= ? AND end_timestamp > ? AND end_timestamp < ?
-                {favorites_clause}
-                ORDER BY end_timestamp DESC, completed_at DESC
-                LIMIT 1
-                """,
-                (start_ts, start_ts, end_ts),
-            ).fetchone()
-        return dict(row) if row else None
+    def find_covering(self, start_ts, end_ts, require_favorites=False):
+        row = self._coverage_from(start_ts, require_favorites)
+        return row if row and row['end_timestamp'] >= end_ts else None
+
+    def find_prefix(self, start_ts, end_ts, require_favorites=False):
+        row = self._coverage_from(start_ts, require_favorites)
+        return row if row and start_ts < row['end_timestamp'] < end_ts else None
 
     def add_coverage(
         self,

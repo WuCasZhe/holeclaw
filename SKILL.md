@@ -1,139 +1,88 @@
 ---
 name: holeclaw
-description: HoleClaw performs rate-limited, bounded-concurrency, read-only collection and Markdown summarization of authenticated PKU Treehole posts, with a persistent collector, resumable checkpoints, and a reusable local SQLite cache. Use when the user invokes HoleClaw or asks to crawl, browse, count, filter, summarize, or generate a daily/report digest of high-comment or high-favorite posts from treehole.pku.edu.cn, including requests such as "北大树洞近 7 天评论数大于 100 的帖子", "收藏数大于 50 的树洞", or "树洞高评论日报".
+description: 只读采集北大树洞帖子，按时间、评论数和收藏数筛选，生成 Markdown 报告或归档帖子、评论及图片，支持 SQLite 缓存复用、断点续传和离线搜索。用于 HoleClaw、树洞高评论/高收藏日报、历史归档与检索请求。
 ---
 
 # HoleClaw
 
-Use the bundled browser collector and renderer. Keep the workflow read-only and never request the user's password, QR token, authorization header, cookie, or other login secret in chat.
+使用本技能目录中的 `scripts/run_digest.py` 和持久浏览器采集器。独立命令不调用 LLM；报告摘要由文本清理和截断生成。调用时从当前技能实际位置确定脚本路径，不假定工作目录就是技能目录。
 
-## Interpret parameters
+## 选择命令
 
-- Accept `近 N 天` as `--days N`.
-- Accept an explicit inclusive local date range as `--since YYYY-MM-DD --until YYYY-MM-DD`.
-- Accept `评论数大于 N` as `--min-comments N`. The comparison is strictly `reply > N`.
-- Accept `收藏数大于 N` or `关注数大于 N` as `--min-favorites N`. The comparison is strictly `likenum > N`.
-- When both thresholds are present, default to both conditions (logical AND). If the user
-  explicitly says "or" / "或者" / "任一", pass `--match-mode any` for logical OR.
-- Default to `--days 30 --min-comments 50` only when the user omits both engagement thresholds. A favorite-only request must not silently add the default comment filter.
-- Reject non-positive days, negative thresholds, an end before a start, and future-only ranges.
-- Warn before scanning a range older than 90 days or a past range far behind the current feed; the API is newest-first and must traverse intervening posts.
+| 请求 | 子命令 | 未指定范围或阈值时 |
+| --- | --- | --- |
+| 筛选帖子并生成 Markdown 报告 | `run` | 近 30 天；未设任何热度阈值时评论数 > 50 |
+| 无 AI 独立运行，必要时交互登录 | `standalone` | 与 `run` 相同 |
+| 保存帖子、每帖最多 1000 条评论和可选图片 | `archive` | 全部可访问历史、全部帖子；必须指定本地账号标签 |
+| 搜索已归档的帖子和评论 | `archive-search` | 必须指定档案库和关键词，无需登录 |
+| 手动建立或刷新登录 | `login-open`、`login-save` | 用户自行完成认证后保存状态 |
 
-## Run the workflow
-
-Set the skill path from the current skill location:
+先用对应子命令的 `-h` / `--help` 查看逐项中文说明、缩写、范围和默认值。所有原长参数继续可用。
 
 ```bash
-SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/holeclaw"
+# 以下示例假定当前目录为技能目录；实际调用可替换为脚本绝对路径
+python3 scripts/run_digest.py run -d 7 -c 100
+python3 scripts/run_digest.py standalone -d 7 -f 50
+python3 scripts/run_digest.py archive -a my-account -d 300 -f 15
+python3 scripts/run_digest.py archive -a my-account -d 7 -f 20 -I
+python3 scripts/run_digest.py archive-search -C /path/to/archive.sqlite3 -q 关键词 -n 50
+python3 scripts/run_digest.py archive -h
 ```
 
-### 1. Establish login when needed
+## 参数与筛选语义
 
-Open a visible browser:
+- “近 N 天”使用 `-d / --days N`；`-b / --since` 和 `-e / --until` 接受 `YYYY-MM-DD`，包含起止当天，使用上海时区。指定起始日期时优先于天数。
+- `-c / --min-comments N` 和 `-f / --min-favorites N` 都是严格大于。只指定收藏阈值时，不附加默认评论阈值。
+- 两个阈值默认同时满足；用户说“或者/任一”时使用 `-m / --match-mode any`，该模式需要两个阈值。
+- `archive` 不自动添加报告模式的默认筛选条件。`-a / --account` 是本地隔离标签，不会自动核实网站登录者身份；不同账号使用不同标签和登录状态。
+- 全局 `-s / --state`、`-l / --session` 放在子命令之前。`-o / --output` 在报告模式指定 Markdown 路径，在归档模式额外保存 JSON 摘要。未指定报告路径时输出到工作目录的 `reports/`。
+- 非正天数、负阈值、反向或完全未来的时间窗口由脚本拒绝。历史扫描需要翻过中间的列表页，长范围可能耗时很久；用户已明确指定范围时直接执行。
 
-```bash
-python3 "$SKILL_DIR/scripts/run_digest.py" login-open
-```
+## 登录与运行环境
 
-Ask the user to complete PKU authentication in the visible browser. Pause until the user confirms that the Treehole home page is visible. Then save the local state:
+已有有效登录状态可直接采集。默认状态文件为工作目录下的 `.auth/pku-treehole.json`，不要读取或输出其内容，也不要在聊天中索取密码、Cookie、令牌或认证头。
 
-```bash
-python3 "$SKILL_DIR/scripts/run_digest.py" login-save
-```
+`standalone` 和 `archive` 在缺少或失效的登录状态下打开可见浏览器，等待用户自行认证、进入树洞首页，并在终端按 Enter；随后脚本保存状态并继续。`-y / --non-interactive` 使用无头浏览器，登录失效时直接失败，适合首次登录后的定时任务。
 
-The default state path is `.auth/pku-treehole.json`. The script sets mode `0600` and adds `.auth/` to the current workspace `.gitignore`. Do not print or inspect the state contents.
-Normal collection runs load this state but do not save it again. Persist authentication only through the explicit `login-save` command, after login or when the session must be refreshed.
+需要显式刷新登录时运行 `login-open`，等用户完成认证后运行 `login-save`。普通采集不自动重存有效登录状态。账号相关的点赞、关注、发帖、评论等写操作不属于本技能。
 
-### 2. Collect and render
+独立运行依赖 Python 3.10+、Node.js/npm、受支持的本地浏览器；使用随包提供的 `playwright_cli.sh` / `.cmd`，不依赖另外安装的 Playwright 技能。
 
-Examples:
+Python、Node/浏览器、本地回调和 SQLite 必须在同一原生环境。WSL 启动时，脚本发现实际使用 Windows `npx` 会自动转交 Windows Python，转换显式路径及其缩写，使用 `.cmd`，将默认缓存放在 Windows 本地存储。WSL 原生 Node 则保持全程 WSL。不要将 Windows 浏览器连接到 WSL 的 `127.0.0.1` 回调，也不要将 Windows SQLite WAL 数据库放在 WSL UNC 路径上。
 
-```bash
-# Rolling time window
-python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-comments 100
+## 并发、进度与落盘
 
-# Favorite-only filter
-python3 "$SKILL_DIR/scripts/run_digest.py" run --days 7 --min-favorites 50
+- 默认请求并发及可配置上限均为 **8**；`-j / --concurrency` 接受 **1–8**。列表预取、详情、评论、图片和重试共用一个请求限额，不是每种请求各有 8 个。启动日志显示配置上限；实际并发可能因短范围、工作量、抖动或降速而更低。
+- 保持每个请求 0.6–2 秒抖动。429 会降低有效并发；所有工作线程共享重试冷却，最多尝试三次。认证失败、无进展的重复页和未知响应结构停止采集。
+- 整次任务只有一个持久采集进程。页面可乱序完成，但必须按连续页序提交；预取与缓冲窗口保持有界。进度和完成通过带令牌的本地回调通知，不增加 Playwright 轮询。
+- `-B / --cache-chunk-pages` 默认 **1**，范围 1–20；每个列表页作为一批写入 SQLite。缓存选帖批次切换到网络列表及结束时立即提交余量，不能混用两类数据块。
+- `-p / --progress-pages` 默认 **1**，每新增一个已提交列表页输出一次。每条进度显示已处理到的最旧帖子日期，使用上海时区；结束或中断时补报剩余进展。
+- `-t / --progress-seconds` 默认 **0**，关闭时间进度；启用须至少 10 秒。长时间处理一页内的评论时可设 `-t 120`，有新进展才额外汇报。列表页数在该页评论处理完成并提交之前不会增加。
+- `-K / --checkpoint-pages` 默认 **100**，范围 1–500；完成、错误或中断时保存最新已提交进度。列表提交批次大于日志间隔时，日志在下一次提交后出现。
+- 总网络列表页数默认不限；用户需要上限时指定 `-n / --max-total-pages` 正整数。归档缓存选帖批次不占网络页额度。
 
-# Require both thresholds
-python3 "$SKILL_DIR/scripts/run_digest.py" run \
-  --days 7 --min-comments 100 --min-favorites 50
+## 缓存与续传
 
-# Require either threshold (logical OR)
-python3 "$SKILL_DIR/scripts/run_digest.py" run \
-  --days 60 --min-comments 100 --min-favorites 45 --match-mode any
+运行时默认位于 `${HOLECLAW_RUNTIME_DIR}`；未设置时为 `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`。共享列表库为 `holeclaw-cache-v5.sqlite3`，检查点为 `holeclaw-checkpoints-v4/`。账号档案位于 `archives/<账号标签哈希>/archive.sqlite3`。`-C / --cache` 覆盖所用数据库，`-S / --source-cache` 指定归档复用的列表库，`-k / --checkpoint` 指定检查点。
 
-# Inclusive local calendar range
-python3 "$SKILL_DIR/scripts/run_digest.py" run \
-  --since 2026-07-01 --until 2026-07-31 --min-comments 80
+归档库仅保存命中帖子及其评论；全部列表行保存在独立列表库以复用不同阈值和时间范围。收藏数缺失时只补查该帖详情；仍不可用则明确记录，不使整段收藏覆盖失效。不可用收藏数不满足收藏阈值，但在 `any` 模式仍可由评论阈值命中。
 
-# Long range with resumable checkpoints
-python3 "$SKILL_DIR/scripts/run_digest.py" run \
-  --days 365 --min-comments 100 \
-  --checkpoint-pages 100 --max-total-pages 2000
-```
+重新运行同一命令从检查点续传。未完成的滚动窗口保持第一次运行的时间边界；完成后再运行按当前时间规划窗口并复用历史覆盖。修改并发、批量或日志参数不改变检查点匹配条件。`Ctrl+C` 取消浏览器请求和等待、保存已提交进度；未提交的列表页或评论批次下次重采并去重。
 
-Use `--output PATH` only when the user specifies an output location. Otherwise write under `reports/` in the current workspace.
+`-F / --fresh` 仅在用户明确要求重新联网核对时使用，会忽略旧覆盖和检查点并更新已有内容，不删除历史档案。缓存不保证旧帖热度或文字未变化。显式提供不兼容的数据库或检查点时按脚本报错处理，不擅自删除或替换。
 
-### Standalone Playwright automation without AI
+## 评论与图片归档
 
-When the user wants HoleClaw to run without Codex or AI assistance, use the bundled standalone entry point:
+文字模式每个评论页请求 10 条，图片模式请求 100 条；单帖最多采集 1000 条去重评论，达到上限或读到空页即完成，短页不能当作结束。断点续传计入已保存评论，已有超过上限的缓存不裁剪。`-P / --comment-batch-pages` 默认 **10**，范围 1–20，帖子结束时提交剩余评论。评论按 `(pid, cid)` 去重，已完成且评论数量匹配的快照可复用。
 
-```bash
-python3 "$SKILL_DIR/scripts/run_digest.py" standalone \
-  --days 7 --min-favorites 50
-```
+默认归档文字。`-i / --extract-images` 保存图片引用；`-I / --download-images` 同时下载原图至账号档案的 `images/`。图片以本地元数据和文件状态续传；已验证的帖子不可用响应记录后继续，其余认证或未知错误停止。
 
-The repository bundles `scripts/playwright_cli.sh` and `scripts/playwright_cli.cmd`, so standalone mode does not depend on the separate Codex Playwright skill. It still requires Python 3.10+, Node.js/npm (`npx`), and a supported local browser. It makes no LLM or AI API calls; one-line report summaries are deterministic text cleanup and truncation.
+修改分页方式或重新探测接口前，阅读 [列表分页证据](references/pagination.md)。修改评论、图片接口、分页单位或缺失帖子处理前，阅读 [评论与图片接口证据](references/archive-comments.md)。现有列表使用 `page + limit=500`，不要假设存在可用的时间/PID 游标。
 
-Keep Python, Playwright/Node, the tokenized localhost sink, and SQLite in one native runtime. When launched from WSL, the entry point inspects the actual `npx` selected by the bundled wrapper. If it is Windows-backed under `/mnt/`, automatically re-execute with Windows Python, translate explicit `--state`, `--cache`, `--checkpoint`, and `--output` paths, use the native `.cmd` wrapper, and keep the default cache on Windows storage. If `npx` is WSL-native, keep the entire run in WSL. Never run a Windows browser collector against a WSL `127.0.0.1` sink or place Windows SQLite WAL files on a WSL UNC path.
+## 验证与交付
 
-If the saved state is missing or expired, standalone mode opens a headed browser and pauses once. The user must personally complete PKU authentication, navigate to the Treehole home page, and press Enter in the terminal. The script then saves the local state and continues automatically. Never fill credentials or bypass authentication.
+报告核对 PID 唯一、窗口与阈值满足、每项包含帖子编号和一行摘要。归档核对本次命中数量、已完成/未完成评论快照、图片状态，并区分本次统计与 `archive_totals` 历史总数。网络采集后检查 SQLite 完整性结果为 `ok`。
 
-For cron/systemd after the initial interactive login, add `--non-interactive`. This uses a headless browser and makes missing or expired login state fail immediately instead of waiting on stdin. Always use a stable working directory or explicit `--state`, `--cache`, `--checkpoint`, and `--output` paths so scheduled runs reuse the intended state and cache. Global `--state` and `--session` options must appear before the `standalone` subcommand.
+只有到达时间起点或接口耗尽才视为完成；达到人工页数上限或中断时说明续传位置，不称为完整结果。可访问内容和扫描时快照不等于网站所有历史内容的完整备份。
 
-Use one persistent browser collector for the whole run. It performs list parsing and time/comment/favorite filtering inside the request process, then streams compact cache chunks to the same Python process over a tokenized localhost callback. Progress and completion are event-driven from that callback; do not add Playwright/session-storage polling or one CLI process per page/checkpoint. Requests use a rolling bounded worker pool (`--concurrency 1..4`, default `4`); completed pages may finish out of order but must be buffered and committed to the sink strictly in page order. Keep the total in-flight-plus-buffered page window bounded.
-
-The authenticated `list_comments` endpoint currently supports page-number pagination only. The 2026-08-11 frontend inspection and low-frequency probes found no working time/PID cursor; read [references/pagination.md](references/pagination.md) before changing pagination or probing the endpoint again. Keep `page + limit=500` and rely on checkpoints plus the SQLite coverage cache for historical scans.
-
-Write the visible checkpoint every `--checkpoint-pages` pages; the default is 100 pages and the maximum is 500. SQLite/WAL cache chunks default to one page so a failure replays at most the current page. Errors and keyboard interrupts terminate the collector process, flush the latest durable progress, and report the next resumable page without a traceback. Re-run the exact same command to resume from `next_page`; an unfinished rolling run keeps its first start and end timestamps frozen. After it completes, the next invocation recalculates the rolling window and reuses SQLite coverage instead of returning the old frozen report. Checkpoint schema v4 retains matched PIDs and counters, while complete post bodies and unavailable-favorite metadata remain in SQLite only.
-
-Store the reusable runtime under `${HOLECLAW_RUNTIME_DIR}` when set, otherwise under `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`. Keep checkpoint schema v4 in `holeclaw-checkpoints-v4/` and the shared cache schema v5 at `holeclaw-cache-v5.sqlite3`, both with mode `0600`. This user-level default is stable across working directories and intentionally shared across thresholds and reports; explicit `--cache` and `--checkpoint` still override it. Older default files remain untouched and are not migrated; an explicitly supplied incompatible cache or checkpoint must fail and ask for a new path. Reuse complete coverage for different thresholds, AND/OR modes, or shorter ranges, and scan only the new head when an older coverage interval contains the requested start. Within schema v5, comment-only coverage with incomplete favorite data remains reusable for comment-only reports, but favorite-filtered reports must rescan that coverage once to populate `likenum`. If a list favorite count is missing or invalid, fetch only that post's detail once. If the detail also lacks a usable count, record the PID as explicitly unavailable, keep the rest of the favorite coverage reusable, and mention it in the report. Use `--fresh` only when the user explicitly requests a network refresh that ignores reusable coverage.
-
-After a network run, use the terminal `telemetry` object to distinguish request time, pacing delay, retry backoff, response size, and SQLite write time before proposing rate changes. Do not infer that the configured jitter is the bottleneck from total runtime alone.
-
-### 3. Handle authentication expiry
-
-If `run` reports that the page returned to `iaaa.pku.edu.cn`, repeat `login-open`, pause for the user's login, then run `login-save` and retry. Never attempt to fill the account or password fields.
-
-## Request-safety rules
-
-- Keep the bundled fixed page size and 0.6–2 second jitter; do not lower the delay.
-- Keep the checkpoint interval at or below 500 pages and the default total safety ceiling at 2,000 pages.
-- Keep one persistent collector process and cap concurrent Treehole requests at 4.
-- Keep progress/completion event-driven through the localhost sink; never poll with extra Playwright CLI calls.
-- Filter requested comment/favorite matches inside the browser request process; send cache chunks only to the tokenized `127.0.0.1` sink.
-- Save accumulated PIDs, counts, and `next_page` atomically at checkpoint boundaries and on errors.
-- Store all list rows in SQLite/WAL so later thresholds and covered time ranges can be rendered without rescanning.
-- Commit cache chunks and advance `next_page` only across a contiguous ordered page range, regardless of request completion order.
-- Share `Retry-After` cooldown across all concurrent workers; never let each worker create an independent retry storm.
-- Stop as soon as the collector crosses the requested start time.
-- Honor `Retry-After`; back off on transient fetch/network errors and 429/5xx, then stop after three failed attempts.
-- Do not mass-fetch detail endpoints when list responses already contain the full post text, reply count, and favorite count. Fetch details only when required data is missing.
-- A post with an explicitly unavailable favorite count does not match a favorite threshold. In
-  `--match-mode any`, it may still match the comment threshold.
-- Do not like, follow, comment, publish, or modify account state.
-- Do not auto-save browser authentication after scans; use `login-save` only after an intentional login refresh.
-
-## Verify the result
-
-After the script completes, check:
-
-- `reached_start` is true.
-- SQLite `PRAGMA integrity_check` returns `ok` after a network run.
-- Every entry satisfies the requested logic: every threshold in `all` mode, or at least one threshold in `any` mode.
-- PIDs are unique.
-- Entries fall inside the requested time window.
-- The report contains a treehole number and a one-line content summary for every entry.
-
-Return a clickable path to the Markdown report plus scanned-page, scanned-post, and matched-post counts. Mention that comment and favorite counts are scan-time snapshots and that image posts summarize captions only unless the user explicitly requests image analysis.
+提供实际报告或摘要文件的可点击路径，简述页数、扫描与命中数量；归档同时说明评论及图片结果。评论和收藏数是快照；未明确要求图片分析时不推断图像内容。评估性能时使用 `telemetry` 的请求、抖动、退避、写入和实际耗时字段，`max_in_flight` 表示观测峰值；并发请求耗时之和不能当作墙钟时间，也不能把配置为 8 描述成实测一直有 8 个请求。

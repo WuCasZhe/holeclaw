@@ -11,11 +11,11 @@ const config = {
   match_mode: 'all',
   start_page: 1,
   page_size: 500,
-  max_pages: 3,
+  max_pages: 9,
   pages_before: 0,
   checkpoint_pages: 500,
   cache_chunk_pages: 1,
-  request_concurrency: 3,
+  // Omit request_concurrency to exercise the JavaScript default of eight.
   delay_min_ms: 600,
   delay_max_ms: 2000,
   sink_url: 'http://127.0.0.1:12345/ingest?token=test',
@@ -31,7 +31,7 @@ const remoteFetch = async (url) => {
   remoteInFlight += 1;
   maxRemoteInFlight = Math.max(maxRemoteInFlight, remoteInFlight);
   await new Promise((resolve) => {
-    if (pageNumber === 1) {
+    if (pageNumber === 2) {
       setImmediate(() => setImmediate(resolve));
     } else {
       setImmediate(resolve);
@@ -43,7 +43,7 @@ const remoteFetch = async (url) => {
     ? [{ pid: 'newer', timestamp: 180, reply: 2, likenum: 1, type: 'text', text: 'newer' }]
     : [{
         pid: `older-${pageNumber}`,
-        timestamp: pageNumber === 2 ? 90 : 80,
+        timestamp: pageNumber === 2 ? 170 : 90,
         reply: 3,
         likenum: 2,
         type: 'text',
@@ -54,16 +54,17 @@ const remoteFetch = async (url) => {
 
 (async () => {
     const { result, sinkPayloads } = await runCollector({ config, remoteFetch });
-    assert.equal(maxRemoteInFlight, 3, 'list requests should overlap within the configured cap');
-    assert.equal(completionOrder.at(-1), 1, 'the mock should complete page 1 out of order');
+    assert.equal(maxRemoteInFlight, 8, 'list requests should reach the default cap of eight');
+    assert.equal(completionOrder[0], 1, 'probe the first page before expanding');
+    assert.equal(completionOrder.at(-1), 2, 'the mock should complete page 2 out of order');
     assert.deepEqual(
       sinkPayloads.map((payload) => payload.start_page),
-      [1, 2],
+      [1, 2, 3],
       'sink commits must remain ordered',
     );
     assert.deepEqual(
       sinkPayloads.map((payload) => payload.end_page),
-      [1, 2],
+      [1, 2, 3],
       'each committed cache chunk must remain contiguous',
     );
     assert.equal(sinkPayloads.at(-1).terminal, true);
@@ -86,12 +87,12 @@ const remoteFetch = async (url) => {
         (total, payload) => total + payload.telemetry.overfetch_pages,
         0,
       ),
-      1,
+      6,
       'a fetched page beyond the time boundary must not advance the checkpoint',
     );
     assert.equal(
       Math.max(...sinkPayloads.map((payload) => payload.telemetry.max_in_flight)),
-      3,
+      8,
     );
     process.stdout.write('collect concurrency smoke test: ok\n');
 })().catch((error) => {

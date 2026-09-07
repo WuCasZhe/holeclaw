@@ -1,4 +1,5 @@
 import argparse
+import json
 import importlib.util
 import sqlite3
 import tempfile
@@ -51,18 +52,63 @@ class ThresholdTests(unittest.TestCase):
         run_digest.resolve_thresholds(args)
         self.assertEqual(run_digest.window_spec(args)["match_mode"], "any")
 
-    def test_cache_chunks_default_to_one_page(self) -> None:
-        self.assertEqual(self.parse_run().cache_chunk_pages, 1)
+    def test_cache_and_progress_default_to_one_page(self) -> None:
+        for command in ('run', 'standalone', 'archive'):
+            arguments = [command, '-a', 'test'] if command == 'archive' else [command]
+            args = run_digest.build_parser().parse_args(arguments)
+            self.assertEqual(args.cache_chunk_pages, 1)
+            self.assertEqual(args.progress_pages, 1)
 
-    def test_request_concurrency_defaults_to_four_and_is_configurable(self) -> None:
-        self.assertEqual(self.parse_run().concurrency, 4)
+    def test_short_options_preserve_long_option_values(self):
+        parser = run_digest.build_parser()
+        short = parser.parse_args(['-s', 'login.json', '-l', 'session', 'archive',
+            '-a', 'my-account', '-d', '300', '-f', '15', '-p', '5', '-B', '5',
+            '-P', '10', '-t', '120', '-C', 'archive.db', '-S', 'source.db',
+            '-k', 'cp.json', '-o', 'out.json', '-j', '2', '-K', '50', '-n', '2000', '-y'])
+        long = parser.parse_args(['--state', 'login.json', '--session', 'session', 'archive',
+            '--account', 'my-account', '--days', '300', '--min-favorites', '15',
+            '--progress-pages', '5', '--cache-chunk-pages', '5', '--comment-batch-pages', '10',
+            '--progress-seconds', '120', '--cache', 'archive.db', '--source-cache', 'source.db',
+            '--checkpoint', 'cp.json', '--output', 'out.json', '--concurrency', '2',
+            '--checkpoint-pages', '50', '--max-total-pages', '2000', '--non-interactive'])
+        self.assertEqual(vars(short), vars(long))
+
+    def test_progress_validation(self):
+        for option, value in [('-p', '0'), ('-p', '-1'), ('-t', '-1'), ('-t', '9')]:
+            with self.subTest(option=option, value=value), self.assertRaises(run_digest.CliError):
+                run_digest.validate_progress_arguments(self.parse_run(option, value))
+        run_digest.validate_progress_arguments(self.parse_run('-t', '0'))
+        run_digest.validate_progress_arguments(self.parse_run('-t', '10'))
+
+    def test_request_concurrency_defaults_to_eight_and_is_configurable(self) -> None:
+        for command in ('run', 'standalone', 'archive'):
+            arguments = [command, '-a', 'test'] if command == 'archive' else [command]
+            self.assertEqual(run_digest.build_parser().parse_args(arguments).concurrency, 8)
         self.assertEqual(self.parse_run("--concurrency", "1").concurrency, 1)
+        self.assertEqual(self.parse_run('-j', '8').concurrency, 8)
 
     def test_checkpoint_interval_defaults_to_one_hundred_pages(self) -> None:
         self.assertEqual(self.parse_run().checkpoint_pages, 100)
 
+    def test_total_page_limit_is_unbounded_by_default(self) -> None:
+        self.assertIsNone(self.parse_run().max_total_pages)
+
+    def test_total_page_limit_remains_available_as_an_opt_in_safety_cap(self) -> None:
+        self.assertEqual(
+            self.parse_run("--max-total-pages", "6000").max_total_pages,
+            6000,
+        )
+
+    def test_unbounded_resume_has_no_remaining_page_cap(self) -> None:
+        self.assertIsNone(run_digest.remaining_page_limit(None, 2000))
+
+    def test_explicit_page_limit_is_total_across_resumes(self) -> None:
+        self.assertEqual(run_digest.remaining_page_limit(6000, 2000), 4000)
+        with self.assertRaisesRegex(run_digest.CliError, "max-total-pages=2000"):
+            run_digest.remaining_page_limit(2000, 2000)
+
     def test_request_concurrency_rejects_values_above_safety_cap(self) -> None:
-        args = self.parse_run("--concurrency", "5")
+        args = self.parse_run("--concurrency", "9")
         with self.assertRaisesRegex(run_digest.CliError, "--concurrency"):
             run_digest.run_digest(args)
 
@@ -86,6 +132,28 @@ class ThresholdTests(unittest.TestCase):
         self.assertTrue(run_digest.should_reuse_checkpoint(rolling, unfinished))
         self.assertFalse(run_digest.is_rolling_window(fixed))
         self.assertTrue(run_digest.should_reuse_checkpoint(fixed, completed))
+
+    def test_open_ended_since_and_future_until_do_not_reuse_completed_checkpoint(self):
+        today = run_digest.datetime.now(run_digest.SHANGHAI).date()
+        for options in (
+            ["--since", "2026-01-01"],
+            ["--since", "2026-01-01", "--until", today.isoformat()],
+            ["--days", "7", "--until", (today + run_digest.timedelta(days=2)).isoformat()],
+        ):
+            with self.subTest(options=options):
+                args = self.parse_run(*options)
+                self.assertFalse(run_digest.should_reuse_checkpoint(args, {"completed": True}))
+                self.assertTrue(run_digest.should_reuse_checkpoint(args, {"completed": False}))
+
+    def test_completed_checkpoint_clipped_before_until_must_extend_after_deadline(self):
+        args = self.parse_run("--since", "2026-01-01", "--until", "2026-01-02")
+        end = int(run_digest.datetime(2026, 1, 3, tzinfo=run_digest.SHANGHAI).timestamp())
+        self.assertFalse(run_digest.should_reuse_checkpoint(
+            args, {"completed": True, "end_timestamp": end - 3600}
+        ))
+        self.assertTrue(run_digest.should_reuse_checkpoint(
+            args, {"completed": True, "end_timestamp": end}
+        ))
 
     def test_future_until_keeps_the_requested_rolling_duration(self) -> None:
         tomorrow = run_digest.datetime.now(run_digest.SHANGHAI).date() + timedelta(days=1)
@@ -286,6 +354,14 @@ class StandaloneTests(unittest.TestCase):
 
 
 class RuntimeRoutingTests(unittest.TestCase):
+    def test_windows_short_paths_support_separate_equals_and_attached_values(self):
+        with patch.object(run_digest, 'windows_native_path', side_effect=lambda value: 'WIN:' + value):
+            self.assertEqual(run_digest.windows_cli_arguments([
+                '-s', '/home/state.json', 'archive', '-a', 'test', '-C=/mnt/c/archive.db',
+                '-S/mnt/c/source.db', '-k', '/home/cp.json', '-o/home/out.json', '-d300']),
+                ['-s', 'WIN:/home/state.json', 'archive', '-a', 'test', '-C=WIN:/mnt/c/archive.db',
+                 '-S', 'WIN:/mnt/c/source.db', '-k', 'WIN:/home/cp.json', '-o', 'WIN:/home/out.json', '-d300'])
+
     def test_windows_cli_arguments_convert_only_path_options(self) -> None:
         converter = lambda value: f"WIN:{value}" if value.startswith("/") else value
         with patch.object(run_digest, "windows_native_path", side_effect=converter):
@@ -312,6 +388,15 @@ class RuntimeRoutingTests(unittest.TestCase):
         ):
             self.assertIsNone(run_digest.maybe_reexec_windows_runtime(["run"]))
         execute.assert_not_called()
+
+    def test_native_wsl_paths_stay_posix(self):
+        path = Path("scripts/collect.js")
+        with (
+            patch.object(run_digest, "is_wsl", return_value=True),
+            patch.object(run_digest, "windows_native_path") as convert,
+        ):
+            self.assertEqual(run_digest.native_path(path), str(path.resolve()))
+        convert.assert_not_called()
 
     def test_wsl_with_windows_npx_reexecutes_windows_python(self) -> None:
         completed = argparse.Namespace(returncode=7)
@@ -363,10 +448,10 @@ class ProcessInterruptionTests(unittest.TestCase):
     def test_stop_collector_process_terminates_and_waits(self) -> None:
         process = MagicMock()
         process.poll.return_value = None
-        with patch.object(run_digest.os, "name", "posix"):
+        with patch.object(run_digest.os, "name", "posix"), patch.object(run_digest.os, "killpg", create=True) as killpg, patch.object(run_digest.signal, "SIGKILL", 9, create=True):
             run_digest.stop_collector_process(process, timeout=1)
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=1)
+        self.assertEqual([call.args[1] for call in killpg.call_args_list], [run_digest.signal.SIGTERM, 9])
+        self.assertEqual(process.wait.call_count, 2)
         process.kill.assert_not_called()
 
     def test_stop_collector_process_kills_after_timeout(self) -> None:
@@ -376,10 +461,10 @@ class ProcessInterruptionTests(unittest.TestCase):
             run_digest.subprocess.TimeoutExpired("collector", 1),
             0,
         ]
-        with patch.object(run_digest.os, "name", "posix"):
+        with patch.object(run_digest.os, "name", "posix"), patch.object(run_digest.os, "killpg", create=True) as killpg, patch.object(run_digest.signal, "SIGKILL", 9, create=True):
             run_digest.stop_collector_process(process, timeout=1)
-        process.terminate.assert_called_once_with()
-        process.kill.assert_called_once_with()
+        self.assertEqual([call.args[1] for call in killpg.call_args_list],
+                         [run_digest.signal.SIGTERM, 9])
         self.assertEqual(process.wait.call_count, 2)
 
 
@@ -939,6 +1024,52 @@ class RunSinkTests(unittest.TestCase):
             match_mode,
         )
         return cache, checkpoint, sink
+
+    def retry_payload(self):
+        return {
+            "schema_version": run_digest.SINK_SCHEMA_VERSION,
+            "start_page": 1, "end_page": 1, "pages": 1, "scanned": 1,
+            "rows": [{"pid": "1", "timestamp": 150, "reply": 1,
+                      "favorites": 0, "text": "retry"}],
+            "matched_pids": ["1"], "telemetry": {"list_requests": 1},
+            "terminal": True, "reached_start": True,
+        }
+
+    def test_committed_chunk_retry_is_idempotent(self):
+        cache, checkpoint, sink = self.make_sink()
+        payload = self.retry_payload()
+        sink.ingest(payload)
+        snapshot = json.dumps(checkpoint, sort_keys=True)
+        sink.ingest(json.loads(json.dumps(payload)))
+        self.assertEqual(json.dumps(checkpoint, sort_keys=True), snapshot)
+        self.assertEqual(cache.post_count(), 1)
+        self.assertEqual(sink.progress_sequence, 1)
+        self.assertTrue(sink.result()["reached_start"])
+        payload["rows"][0]["reply"] = 2
+        with self.assertRaisesRegex(run_digest.CliError, "non-sequential"):
+            sink.ingest(payload)
+
+    def test_retry_recovers_checkpoint_write_failure_without_double_counting(self):
+        cache, checkpoint, sink = self.make_sink()
+        payload = self.retry_payload()
+        with patch("scripts.holeclaw_sink.write_checkpoint", side_effect=OSError("disk failure")):
+            with self.assertRaisesRegex(OSError, "disk failure"):
+                sink.ingest(payload)
+        sink.ingest(payload)
+        self.assertEqual(checkpoint["total_pages"], 1)
+        self.assertEqual(checkpoint["telemetry"]["list_requests"], 1)
+        self.assertEqual(cache.post_count(), 1)
+        self.assertEqual(run_digest.read_checkpoint(sink.checkpoint_path)["next_page"], 2)
+
+    def test_outside_window_missing_favorites_do_not_invalidate_coverage(self):
+        for min_favorites in (None, 10):
+            with self.subTest(min_favorites=min_favorites):
+                _cache, checkpoint, sink = self.make_sink(min_favorites=min_favorites)
+                payload = self.retry_payload()
+                payload["rows"][0].update(timestamp=250, favorites=None)
+                payload["matched_pids"] = []
+                sink.ingest(payload)
+                self.assertTrue(checkpoint["favorites_complete"])
 
     def test_cache_chunk_rolls_back_when_second_write_fails(self) -> None:
         cache, checkpoint, sink = self.make_sink(
