@@ -71,4 +71,4 @@ Windows 使用 `python` 代替 `python3`。测试只用合成数据与临时数�
 
 `tests/test_refactoring.py` 覆盖并发重试、回执过期、嵌套回滚、旧检查点转换和清理失败，并实际执行 JS 采集器，将其生成的 v3 消息交给 Python sink。JS harness 为每次采集创建独立 VM，不再覆盖全局 `fetch` 和计时器。既有行为测试通过测试侧适配器继续检查原有列表、评论与图片结果；新增协议测试直接检查原始消息。
 
-性能模型仍可通过 `node benchmarks/cold_collection.js /tmp/holeclaw-model.json` 执行。真实联网测速是独立的显式命令；`benchmarks/live_collection.py` 通过 `CollectorServices` 包装计时，不修改模块全局函数。
+`tests/collector_simulation.js` 为优化回归测试提供确定性离线模拟，使用合成响应和虚拟时钟检查请求统计、分页边界与并发调度。

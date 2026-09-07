@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const {runCollector, response} = require('./collector_harness');
-const {simulate} = require('../benchmarks/cold_collection');
+const {simulate} = require('./collector_simulation');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const config = {
   archive: true, archive_run: 'pipeline',

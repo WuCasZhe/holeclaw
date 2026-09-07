@@ -1,12 +1,10 @@
-// Offline, deterministic scheduling model using the actual collector in a VM.
-// No authentication, browser, real network, cache or production source edits.
-// Run: node benchmarks/cold_collection.js [output.json]
+// Deterministic collector simulation for optimization regression tests.
+// Uses synthetic responses and a virtual clock; no browser or network.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const {createHash} = require('node:crypto');
-const {unpackSinkMessage} = require('../tests/sink_protocol_fixture');
+const {unpackSinkMessage} = require('./sink_protocol_fixture');
 const original = fs.readFileSync(path.join(__dirname, '../scripts/collect.js'), 'utf8');
 
 async function simulate(name, options = {}) {
@@ -38,7 +36,7 @@ async function simulate(name, options = {}) {
   const response = body => ({status: 200, ok: true, headers: {get: () => null},
     text: async () => JSON.stringify(body)});
   const config = {
-    archive, archive_run: 'offline-benchmark',
+    archive, archive_run: 'offline-regression',
     report_start_timestamp: 100, scan_start_timestamp: 100, end_timestamp: 100000,
     min_comments: 0, min_favorites: missingFavorites ? 0 : null,
     page_size: 500, max_pages: pages, request_concurrency: concurrency,
@@ -141,33 +139,4 @@ async function simulate(name, options = {}) {
     telemetry, error: error ? String(error) : null};
 }
 
-async function main() {
-  const cases = [
-    ['list_c1', {archive: false, pages: 24, concurrency: 1}],
-    ['list_c8', {archive: false, pages: 24}],
-    ['sparse_text100', {}], ['sparse_text10_experiment', {limit10: true}],
-    ['sparse_text100_serial_pages', {serialPages: true}],
-    ['dense_text100', {pages: 2, matches: 8}],
-    ['dense_text10_experiment', {pages: 2, matches: 8, limit10: true}],
-    ['long_tail', {pages: 1, matches: 16, replies: [...Array(15).fill(1), 999]}],
-    ['long_tail_sorted_experiment', {pages: 1, matches: 16,
-      replies: [...Array(15).fill(1), 999], longestFirst: true}],
-    ['missing_favorites', {archive: false, pages: 1, missingFavorites: true}],
-    ['slow_sink', {archive: false, pages: 24, sinkMs: 100}],
-    ['very_slow_sink', {archive: false, pages: 24, sinkMs: 2000}],
-    ['repeated_list_bounded_probe', {archive: false, pages: 3, repeat: true}],
-    ['short_window_overfetch', {archive: false, pages: 24, boundary: true}],
-  ];
-  const results = [];
-  for (const [name, options] of cases) results.push(await simulate(name, options));
-  const output = {method: 'OFFLINE MODEL: fixed 1300 ms pacing, 200 ms remote RTT, 2 ms sink unless specified; no retries, browser startup or CPU/serialization costs. Every list has 500 rows; only positive-reply posts match. Experimental edits exist only in VM source.',
-    node: process.version, collector_sha256: createHash('sha256').update(original).digest('hex'), results};
-  if (process.argv[2]) fs.writeFileSync(process.argv[2], JSON.stringify(output, null, 2) + '\n');
-  console.table(results.map(({name, model_wall_ms, requests, unique_comments, observed_peak, telemetry}) => ({
-    name, model_seconds: model_wall_ms / 1000, remote_requests: requests.list + requests.detail + requests.comment,
-    comment_requests: requests.comment, unique_comments, observed_peak,
-    telemetry_wall_seconds: telemetry.wall_ms / 1000,
-  })));
-}
 module.exports = {simulate};
-if (require.main === module) main().catch(error => {console.error(error); process.exitCode = 1;});
