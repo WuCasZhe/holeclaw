@@ -126,8 +126,14 @@ def run_archive(args, services: CollectorServices | None = None):
                               source_instance_id=source.instance_id, fresh=args.fresh,
                               archive_cache_only=plan.cache_only, archive_cached_pages=0, cached_posts=0)
             if base:
-                count = cache.stage_candidates(source_path, checkpoint, FilterSpec.from_args(args),
-                                               end if plan.cache_only else plan.scan_start)
+                filters = FilterSpec.from_args(args)
+                count = (cache.finish_cached_source(source_path, checkpoint, filters, end)
+                         if plan.cache_only and not args.fresh else None)
+                if count is not None:
+                    CheckpointState(checkpoint).finish({'reached_start': True})
+                else:
+                    count = cache.stage_candidates(source_path, checkpoint, filters,
+                                                   end if plan.cache_only else plan.scan_start)
                 checkpoint.update(archive_cached_pages=(count + 499) // 500, cached_posts=count)
             write_checkpoint(checkpoint_path, checkpoint)
         if (not checkpoint['completed'] and checkpoint.get('archive_cache_only')

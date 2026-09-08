@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -72,15 +74,37 @@ def default_cache_path() -> Path:
     return default_runtime_root() / f"holeclaw-cache-v{CACHE_SCHEMA_VERSION}.sqlite3"
 
 
+_checkpoint_writes = OrderedDict()
+_checkpoint_lock = threading.Lock()
+
+
+def checkpoint_signature(path):
+    try:
+        info = path.stat()
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    except FileNotFoundError:
+        return None
+
+
 def write_checkpoint(path: Path, checkpoint: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
-    path.chmod(0o600)
+    path = path.resolve()
+    encoded = (json.dumps(checkpoint, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+    digest = hashlib.sha256(encoded).digest()
+    with _checkpoint_lock:
+        previous = _checkpoint_writes.get(path)
+        if previous and previous[1] is not None and previous == (digest, checkpoint_signature(path)):
+            _checkpoint_writes.move_to_end(path)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + '.tmp')
+        temporary.write_bytes(encoded)
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        path.chmod(0o600)
+        _checkpoint_writes[path] = (digest, checkpoint_signature(path))
+        _checkpoint_writes.move_to_end(path)
+        while len(_checkpoint_writes) > 128:
+            _checkpoint_writes.popitem(last=False)
 
 
 class Checkpoint(TypedDict, total=False):

@@ -62,6 +62,59 @@ class ArchiveStore(CacheStore):
             if 'observed_at' not in columns:
                 self.connection.execute('ALTER TABLE archive_candidates ADD COLUMN observed_at INTEGER')
         install_search_indexes(self)
+        self.install_totals()
+
+    def install_totals(self):
+        """Backfill once; triggers keep counts correct even across transaction rollbacks."""
+        with self.transaction():
+            self.connection.execute('''CREATE TABLE IF NOT EXISTS archive_totals (
+                name TEXT PRIMARY KEY, value INTEGER NOT NULL)''')
+            for table, name, condition in (
+                    ('posts', 'posts', '1'), ('comments', 'comments', '1'),
+                    ('comment_scans', 'posts_with_completed_comment_scan', 'complete=1')):
+                if self.connection.execute('SELECT 1 FROM archive_totals WHERE name=?', (name,)).fetchone():
+                    continue
+                self.connection.execute(f'''INSERT INTO archive_totals
+                    SELECT ?, COUNT(*) FROM {table} WHERE {condition}''', (name,))
+                for action, sign, ref in (('insert', '+', 'new'), ('delete', '-', 'old')):
+                    when = f'WHEN {ref}.complete=1' if table == 'comment_scans' else ''
+                    self.connection.execute(f'''CREATE TRIGGER {table}_total_{action}
+                        AFTER {action.upper()} ON {table} {when} BEGIN
+                        UPDATE archive_totals SET value=value{sign}1 WHERE name='{name}'; END''')
+                if table == 'comment_scans':
+                    self.connection.execute(f'''CREATE TRIGGER {table}_total_update
+                        AFTER UPDATE OF complete ON {table} WHEN old.complete IS NOT new.complete BEGIN
+                        UPDATE archive_totals SET value=value+(new.complete=1)-(old.complete=1)
+                        WHERE name='{name}'; END''')
+
+    def finish_cached_source(self, source_path, checkpoint, filters, end):
+        """Avoid a durable copy of post bodies when the whole selection is already archived."""
+        clause, parameters = filters.sql_clause()
+        selection = f'''SELECT * FROM source.posts WHERE timestamp>=? AND timestamp<?
+            {('AND ' + clause) if clause else ''}'''
+        parameters = [checkpoint['start_timestamp'], end, *parameters]
+        self.connection.execute('ATTACH DATABASE ? AS source', (source_path.as_uri() + '?mode=ro',))
+        try:
+            with self.transaction():
+                # Keep all reads of source in one SQLite snapshot; never use a live
+                # source cursor as a replacement for durable unfinished candidates.
+                pending = self.connection.execute(f'''SELECT 1 FROM ({selection}) c
+                    LEFT JOIN comment_scans s ON s.pid=c.pid
+                    WHERE s.pid IS NULL OR (s.complete!=1 AND s.unavailable IS NULL)
+                        OR s.reply_count IS NULL OR s.reply_count!=c.reply LIMIT 1''', parameters).fetchone()
+                if pending:
+                    return None
+                if self.media and not self.media.posts_complete(
+                        self.connection.execute(selection, parameters)):
+                    return None
+                cursor = self.connection.execute(selection, parameters)
+                count = 0
+                while rows := cursor.fetchmany(500):
+                    self.record_posts([dict(row) for row in rows], checkpoint['created_at'])
+                    count += len(rows)
+                return count
+        finally:
+            self.connection.execute('DETACH DATABASE source')
 
     def stage_candidates(self, source_path, checkpoint, filters, end):
         clause, parameters = filters.sql_clause()
@@ -135,7 +188,9 @@ class ArchiveStore(CacheStore):
             self.connection.executemany("""INSERT INTO comments VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(pid,cid) DO UPDATE SET text=excluded.text,
                 timestamp=excluded.timestamp, name_tag=excluded.name_tag,
-                quote_cid=excluded.quote_cid, observed_at=excluded.observed_at""", values)
+                quote_cid=excluded.quote_cid, observed_at=excluded.observed_at
+                WHERE comments.text IS NOT excluded.text OR comments.timestamp IS NOT excluded.timestamp
+                    OR comments.name_tag IS NOT excluded.name_tag OR comments.quote_cid IS NOT excluded.quote_cid""", values)
             self.connection.execute("""INSERT INTO comment_scans
                 (pid,last_page,complete,observed_at,run_id,reply_count,page_size) VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(pid) DO UPDATE SET last_page=excluded.last_page,
@@ -278,13 +333,9 @@ class ArchiveStore(CacheStore):
                     'SELECT cid FROM comments WHERE pid=? LIMIT 1000', (str(post['pid']),))]
 
     def summary(self, *, verify=False):
-        return {
-            'posts': self.post_count(),
-            'comments': self.connection.execute('SELECT COUNT(*) FROM comments').fetchone()[0],
-            'posts_with_completed_comment_scan': self.connection.execute(
-                'SELECT COUNT(*) FROM comment_scans WHERE complete=1').fetchone()[0],
-            'cache_integrity': self.integrity_check() if verify else 'not_checked',
-        }
+        with self.lock:
+            return dict(self.connection.execute('SELECT name,value FROM archive_totals'),
+                        cache_integrity=self.integrity_check() if verify else 'not_checked')
 
     def window_summary(self, checkpoint, filters):
         clause, parameters = filters.sql_clause()

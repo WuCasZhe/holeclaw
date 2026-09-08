@@ -180,7 +180,8 @@ class ArchiveSink(RunSink):
             if not media:
                 raise CliError('Image extraction is not enabled.')
             media.validate_download(str(payload['post']['pid']), payload.get('media_key'))
-        with media.receive(stream, length, payload.get('mime', '')) as prepared:
+            replay = self.receipts.contains(message.request_id)
+        with media.receive(stream, length, payload.get('mime', ''), discard=replay) as prepared:
             # Include the bytes in request identity without serializing them.
             envelope = dict(raw, payload=dict(raw['payload'], binary_sha256=prepared['digest']))
             return self.ingest(envelope, prepared_media=prepared)

@@ -7,7 +7,7 @@ import re
 import stat
 import time
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from collections import OrderedDict, deque
 
@@ -148,14 +148,18 @@ class MediaStore:
                 checked[key] = stat.S_ISREG(info.st_mode) and info.st_size == row['bytes']
             except OSError:
                 checked[key] = False
+            # Cache only within the current verification operation. A later
+            # operation must immediately notice external file deletion/truncation.
+            if len(checked) > 4096:
+                del checked[next(iter(checked))]
         return checked[key]
 
-    def pending_many(self, pids):
+    def pending_many(self, pids, *, checked=None):
         pids = list(dict.fromkeys(str(pid) for pid in pids))
         result = {pid: [] for pid in pids}
         if not self.download:
             return result
-        checked = {}
+        checked = {} if checked is None else checked
         for offset in range(0, len(pids), 500):
             batch = pids[offset:offset + 500]
             for row in self.db.execute(f'''SELECT DISTINCT r.pid,r.media_key,r.source_url,f.path,f.bytes,f.status
@@ -224,9 +228,13 @@ class MediaStore:
 
     def candidates_complete(self, run_id):
         cursor = self.db.execute('SELECT pid,reply FROM archive_candidates WHERE run_id=?', (run_id,))
+        return self.posts_complete(cursor)
+
+    def posts_complete(self, cursor):
+        checked = {}
         while posts := cursor.fetchmany(500):
             states = self.states(posts)
-            pending = self.pending_many([post['pid'] for post in posts])
+            pending = self.pending_many([post['pid'] for post in posts], checked=checked)
             for post in posts:
                 state = states[post['pid']]
                 if not state['unavailable'] and not (state['post_known'] and state['comments_known']):
@@ -241,15 +249,17 @@ class MediaStore:
             raise CliError('Unrequested image download.')
 
     @contextmanager
-    def receive(self, stream, length, mime):
+    def receive(self, stream, length, mime, *, discard=False):
         """Stream/hash/fsync outside the sink lock; only publishing needs it."""
         if type(length) is not int or not 0 <= length <= MAX_IMAGE_BYTES:
             raise CliError('Image exceeds the 20 MiB limit.')
-        self.directory.mkdir(parents=True, exist_ok=True)
+        if not discard:
+            self.directory.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(dir=self.directory, prefix='.upload-', suffix='.part', delete=False) as output:
-                temporary = Path(output.name)
+            with (nullcontext(None) if discard else tempfile.NamedTemporaryFile(
+                    dir=self.directory, prefix='.upload-', suffix='.part', delete=False)) as output:
+                temporary = Path(output.name) if output else None
                 digest = hashlib.sha256()
                 remaining, header = length, b''
                 while remaining:
@@ -259,9 +269,10 @@ class MediaStore:
                     remaining -= len(chunk)
                     header = (header + chunk[:32])[:32]
                     digest.update(chunk)
-                    output.write(chunk)
+                    if output:
+                        output.write(chunk)
                 extension = image_extension(header)
-                if extension:
+                if extension and output:
                     output.flush()
                     os.fsync(output.fileno())
             yield dict(temporary=temporary, digest=digest.hexdigest(), extension=extension,
@@ -271,6 +282,8 @@ class MediaStore:
                 temporary.unlink(missing_ok=True)
 
     def save_received(self, pid, key, prepared):
+        if prepared['temporary'] is None:
+            raise CliError('Image retry has no durable receipt; resume from the saved checkpoint.')
         self.validate_download(pid, key)
         extension, digest = prepared['extension'], prepared['digest']
         relative = digest + extension if extension else None

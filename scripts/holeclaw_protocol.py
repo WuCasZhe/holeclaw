@@ -88,6 +88,10 @@ class ReceiptBook:
             raise CliError('Collector receipt expired; resume from the saved checkpoint.')
         return False, None
 
+    def contains(self, request_id) -> bool:
+        """Presence only; callers must still validate the full payload with lookup."""
+        return request_id in self.entries
+
     def remember(self, message: SinkMessage, response: dict | None) -> None:
         if message.request_id is None:
             return
