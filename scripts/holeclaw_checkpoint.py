@@ -109,6 +109,7 @@ class Checkpoint(TypedDict, total=False):
     archive_cache_only: bool
     cached_posts: int
     source_instance_id: str
+    source_cache_path: str
     archive_summary_version: int
     archive_metrics: dict[str, int]
     oldest_post_timestamp: int

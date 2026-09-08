@@ -9,13 +9,13 @@ from datetime import date, datetime
 try:
     from holeclaw_media import MediaStore
     from holeclaw_cache import CacheStore
-    from holeclaw_domain import CliError, SHANGHAI
+    from holeclaw_domain import CACHE_SCHEMA_VERSION, CliError, SHANGHAI
     from holeclaw_sink import SinkServer
     from holeclaw_search import search_rows
 except ModuleNotFoundError:
     from scripts.holeclaw_media import MediaStore
     from scripts.holeclaw_cache import CacheStore
-    from scripts.holeclaw_domain import CliError, SHANGHAI
+    from scripts.holeclaw_domain import CACHE_SCHEMA_VERSION, CliError, SHANGHAI
     from scripts.holeclaw_sink import SinkServer
     from scripts.holeclaw_search import search_rows
 
@@ -44,6 +44,21 @@ except ModuleNotFoundError:
     from scripts.holeclaw_archive_sink import ArchiveSink
 
 
+def uses_legacy_report_cache(checkpoint: dict) -> bool:
+    """Recognize old shared-cache checkpoints without opening the report DB for writes."""
+    if 'source_cache_path' in checkpoint:
+        return False
+    path = default_cache_path().resolve()
+    if not path.is_file():
+        return False
+    try:
+        with closing(sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True)) as db:
+            row = db.execute("SELECT value FROM metadata WHERE key='instance_id'").fetchone()
+            return bool(row and row[0] == checkpoint.get('source_instance_id'))
+    except sqlite3.Error:
+        return False
+
+
 def run_archive(args, services: CollectorServices | None = None):
     args = copy(args)
     services = services or CollectorServices.default()
@@ -63,8 +78,9 @@ def run_archive(args, services: CollectorServices | None = None):
     legacy_spec = dict(spec)
     spec['comment_page_size'] = 100
     account_key = hashlib.sha256(args.account.encode()).hexdigest()[:16]
-    cache_path = (args.cache or default_runtime_root() / 'archives' / account_key / 'archive.sqlite3').resolve()
-    source_path = (args.source_cache or default_cache_path()).resolve()
+    account_root = default_runtime_root() / 'archives' / account_key
+    cache_path = (args.cache or account_root / 'archive.sqlite3').resolve()
+    source_path = (args.source_cache or account_root / f'list-cache-v{CACHE_SCHEMA_VERSION}.sqlite3').resolve()
     if source_path == cache_path:
         raise CliError('--source-cache must differ from the archive --cache.')
     checkpoint_path = (args.checkpoint or default_checkpoint_path(spec)).resolve()
@@ -88,7 +104,13 @@ def run_archive(args, services: CollectorServices | None = None):
             if should_reuse_checkpoint(args, candidate):
                 checkpoint = candidate
                 if not candidate['completed'] and candidate.get('source_instance_id') != source.instance_id:
-                    raise CliError('Source cache identity changed. Restore it or use --fresh.')
+                    if args.source_cache is None and uses_legacy_report_cache(candidate):
+                        print('归档列表缓存已独立存放，将重新扫描列表；已有评论和图片继续复用。', flush=True)
+                        checkpoint = None
+                    else:
+                        raise CliError('Source cache identity changed. Restore it or use --fresh.')
+                elif not candidate['completed']:
+                    checkpoint['source_cache_path'] = str(source_path)
         if checkpoint and checkpoint['completed'] and cache.media:
             media_status = cache.media.summary(checkpoint['created_at'])
             if args.download_images and media_status['pending']:
@@ -100,6 +122,7 @@ def run_archive(args, services: CollectorServices | None = None):
             checkpoint = plan.new_checkpoint(spec)
             checkpoint.update(cache_path=str(cache_path), cache_instance_id=cache.instance_id,
                               archive_summary_version=1,
+                              source_cache_path=str(source_path),
                               source_instance_id=source.instance_id, fresh=args.fresh,
                               archive_cache_only=plan.cache_only, archive_cached_pages=0, cached_posts=0)
             if base:

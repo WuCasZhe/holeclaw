@@ -52,6 +52,22 @@ python3 scripts/run_digest.py standalone --help
 
 ## 缓存复用
 
+热门报告与本地归档默认使用独立缓存。运行目录为 `${HOLECLAW_RUNTIME_DIR}`，未设置时为 `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`：
+
+```text
+holeclaw-runtime/
+├── holeclaw-cache-v5.sqlite3          # run / standalone 热门报告列表缓存
+├── holeclaw-checkpoints-v4/           # 按任务参数区分的续传检查点
+└── archives/<账号标签哈希>/
+    ├── list-cache-v5.sqlite3          # archive 专用列表缓存
+    ├── archive.sqlite3               # 归档正文、评论及图片元数据
+    └── images/                       # 下载的图片
+```
+
+归档不会默认读取或更新报告列表库，不同账号的归档列表也相互隔离。`--cache` 可覆盖当前命令的主数据库，`archive --source-cache` 可显式覆盖归档列表缓存；自定义路径时需自行保持分离。
+
+已有报告缓存、档案和已完成的固定日期归档继续可用。旧的未完成归档若使用原共享报告库，切换默认路径后会重新扫描列表，复用已保存的评论和图片，并保存新检查点；原报告库保持不变。显式指定 `--source-cache` 的任务仍按原路径续传。
+
 归档按批查询评论和图片状态，跳过没有变化的帖子及归档成员写入。历史列表缓存保留原观察时间，不会因为复用而被标记为刚刚联网获取，也不会覆盖档案中更新的已知帖子字段。
 
 部分候选已完成时，由本地直接登记这些帖子，只将需要补采评论、图片元数据或图片文件的候选交给浏览器。候选页号保持不变，已有检查点可继续使用；同一批共享图片文件只检查一次，文件缺失或大小不符时仍会补下载。

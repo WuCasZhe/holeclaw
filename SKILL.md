@@ -63,7 +63,9 @@ Python、Node/浏览器、本地回调和 SQLite 必须在同一原生环境。W
 
 ## 缓存与续传
 
-运行时默认位于 `${HOLECLAW_RUNTIME_DIR}`；未设置时为 `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`。共享列表库为 `holeclaw-cache-v5.sqlite3`，检查点为 `holeclaw-checkpoints-v4/`。账号档案位于 `archives/<账号标签哈希>/archive.sqlite3`。`-C / --cache` 覆盖所用数据库，`-S / --source-cache` 指定归档复用的列表库，`-k / --checkpoint` 指定检查点。
+运行时默认位于 `${HOLECLAW_RUNTIME_DIR}`；未设置时为 `${CODEX_HOME:-$HOME/.codex}/holeclaw-runtime`。热门报告列表库为 `holeclaw-cache-v5.sqlite3`，检查点为 `holeclaw-checkpoints-v4/`。账号档案位于 `archives/<账号标签哈希>/archive.sqlite3`，归档专用列表缓存位于同目录的 `list-cache-v5.sqlite3`，与报告缓存及其他账号分开。`-C / --cache` 覆盖所用数据库，`-S / --source-cache` 显式指定归档列表库，`-k / --checkpoint` 指定检查点；自定义路径应保持用途隔离。
+
+旧的未完成归档若依赖原共享报告库，使用新默认路径时会重新扫描列表并复用已存评论和图片，写入新检查点；原报告库保持不变。已完成的固定日期归档可直接复用；显式指定列表缓存的任务继续按原路径续传。
 
 归档库仅保存命中帖子及其评论；全部列表行保存在独立列表库以复用不同阈值和时间范围。收藏数缺失时只补查该帖详情；仍不可用则明确记录，不使整段收藏覆盖失效。不可用收藏数不满足收藏阈值，但在 `any` 模式仍可由评论阈值命中。
 

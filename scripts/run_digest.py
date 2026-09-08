@@ -131,7 +131,7 @@ def add_digest_arguments(parser: argparse.ArgumentParser, *, archive: bool = Fal
         help="本轮累计网络列表页上限（正整数，默认不限）；归档的缓存批次不占额度",
     )
     parser.add_argument("-k", "--checkpoint", type=Path, help="续传检查点路径；默认按时间窗口和筛选条件存入运行时目录")
-    parser.add_argument("-C", "--cache", type=Path, help="SQLite 路径；报告默认共享列表库，归档默认按账号隔离的档案库")
+    parser.add_argument("-C", "--cache", type=Path, help="SQLite 路径；报告默认报告列表库，归档默认按账号隔离的档案库")
     parser.add_argument("-F", "--fresh", action="store_true", help="忽略可复用覆盖和旧检查点，重新联网采集；不删除历史档案")
     parser.add_argument("--verify-cache", action="store_true", help="完成时执行 SQLite 全库完整性校验；默认跳过")
     parser.add_argument("-o", "--output", type=Path, help="输出文件；报告默认 reports/ 下的 Markdown，归档指定后另存 JSON 摘要")
@@ -165,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     archive_parser.add_argument("-I", "--download-images", action="store_true", help="提取图片引用并下载原图到账号档案 images/ 目录")
     archive_parser.add_argument("-a", "--account", required=True, help="必填：本地账号标签；不同登录账号使用不同标签")
     archive_parser.add_argument("-y", "--non-interactive", action="store_true", help="无头运行，登录失效时直接报错，不等待用户登录")
-    archive_parser.add_argument("-S", "--source-cache", type=Path, help="可复用列表缓存路径；默认现有报告列表库，与档案库分开")
+    archive_parser.add_argument("-S", "--source-cache", type=Path, help="归档列表缓存路径；默认账号归档目录下的独立列表库，与报告缓存分开")
     archive_parser.add_argument("-P", "--comment-batch-pages", type=int, default=10, help="每 N 个评论页提交一批（1–20，默认 10）；帖子结束时提交余量")
     search_parser = subparsers.add_parser("archive-search", help="离线搜索本地档案，无需登录", allow_abbrev=False)
     search_parser.add_argument("-C", "--cache", type=Path, required=True, help="必填：要搜索的 SQLite 档案库路径")
