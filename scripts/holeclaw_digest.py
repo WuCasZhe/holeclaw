@@ -82,6 +82,7 @@ def emit_cached_report(
     scanned: int,
     cache_reused: bool,
     marker: str,
+    verify: bool = False,
 ) -> None:
     data = cache_report_data(
         cache, report, collected_at, pages, scanned, cache_reused
@@ -94,6 +95,7 @@ def emit_cached_report(
         "scanned": data["scanned"],
         "matched": data["candidate_count"],
         marker: True,
+        "cache_integrity": cache.integrity_check() if verify else "not_checked",
     }
     print(json.dumps(summary, ensure_ascii=False))
 
@@ -202,6 +204,7 @@ def run_digest(args: argparse.Namespace, standalone: bool = False,
                 0 if covering else completed_checkpoint["total_scanned"],
                 bool(covering),
                 cache_marker,
+                verify=getattr(args, 'verify_cache', False),
             )
             return
 
@@ -305,7 +308,7 @@ def run_digest(args: argparse.Namespace, standalone: bool = False,
                     "scanned": data["scanned"],
                     "matched": data["candidate_count"],
                     "reached_start": checkpoint["reached_start"],
-                    "cache_integrity": cache.integrity_check(),
+                    "cache_integrity": cache.integrity_check() if getattr(args, 'verify_cache', False) else "not_checked",
                     "telemetry": checkpoint["telemetry"],
                 },
                 ensure_ascii=False,

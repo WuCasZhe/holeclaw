@@ -15,7 +15,7 @@ const response = (body, { status = 200, retryAfter = null } = {}) => ({
   text: async () => JSON.stringify(body),
 });
 
-async function runCollector({ config, remoteFetch, sinkFetch, wireSinkFetch, onSleep = () => {} }) {
+async function runCollector({ config, remoteFetch, sinkFetch, wireSinkFetch, onSleep = () => {}, deadlineMs, clock = Date }) {
   const sinkPayloads = [];
   const wirePayloads = [];
   const immediateTimer = (callback, milliseconds = 0) => {
@@ -24,10 +24,12 @@ async function runCollector({ config, remoteFetch, sinkFetch, wireSinkFetch, onS
     return 0;
   };
   const fetch = async (url, options = {}) => {
-    if (String(url).startsWith(config.sink_url)) {
-      const wire = JSON.parse(options.body);
+    if (String(url).startsWith(config.sink_url) || String(url).startsWith(config.sink_url.replace('/ingest?', '/media?'))) {
+      const binary = options.headers?.['X-Holeclaw-Message'];
+      const wire = JSON.parse(binary ? decodeURIComponent(binary) : options.body);
       wirePayloads.push(wire);
       const payload = unpackSinkMessage(wire);
+      if (binary) payload.data = Buffer.from(await options.body.arrayBuffer()).toString('base64');
       sinkPayloads.push(payload);
       if (wireSinkFetch) return wireSinkFetch(url, options);
       return sinkFetch ? sinkFetch(url, {...options, body: JSON.stringify(payload)}) : response({ ok: true });
@@ -35,8 +37,9 @@ async function runCollector({ config, remoteFetch, sinkFetch, wireSinkFetch, onS
     return remoteFetch(url, options);
   };
   const collector = vm.runInNewContext(collectorSource, {
-    fetch, setTimeout: immediateTimer, clearTimeout, AbortController, URL, performance,
-    Date, Math, btoa,
+    fetch, setTimeout: immediateTimer, clearTimeout, AbortController, URL, performance, Blob,
+    AbortSignal: {timeout: ms => AbortSignal.timeout(deadlineMs ?? ms)},
+    Date: clock, Math, btoa,
   }, {filename: collectorPath});
 
   let evaluateCount = 0;

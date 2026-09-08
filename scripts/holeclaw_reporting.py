@@ -24,7 +24,7 @@ def one_line_summary(text: str, post_type: str) -> str:
             picked += clause
             if len(picked) >= 45:
                 break
-        value = (picked or value[:112]).strip().rstrip("。！？!?；;") + "…"
+        value = (picked or value)[:112].strip().rstrip("。！？!?；;") + "…"
     if post_type == "image":
         value = f"[图片帖] {value}"
     return value

@@ -114,10 +114,10 @@ def add_digest_arguments(parser: argparse.ArgumentParser, *, archive: bool = Fal
                         help="每 N 个列表页保存续传检查点（1–500，默认 100）；结束或中断时保存已提交进度")
     parser.add_argument("-B", "--cache-chunk-pages", type=int, default=1,
                         help="每 N 个列表页批量写入 SQLite（1–20，默认 1）；未提交页在中断后重扫")
-    parser.add_argument("-p", "--progress-pages", type=int, default=1,
-                        help="每新增 N 个已提交列表页输出进度（正整数，默认 1）；末尾不足 N 页也输出")
-    parser.add_argument("-t", "--progress-seconds", type=int, default=0,
-                        help="有新进展时额外按秒输出（0 关闭，默认 0；启用须 >=10）；评论采集耗时长时可设 120")
+    parser.add_argument("-p", "--progress-pages", type=int, default=0 if archive else 1,
+                        help="每新增 N 个已提交列表页输出进度（0 关闭；归档默认 0，报告默认 1）；阶段结束时汇报剩余进展")
+    parser.add_argument("-t", "--progress-seconds", type=int, default=300 if archive else 0,
+                        help="有新进展时按秒输出（0 关闭；归档默认 300，报告默认 0；启用须 >=10）；与页数条件任一满足即输出")
     parser.add_argument(
         "-j", "--concurrency",
         type=int,
@@ -133,6 +133,7 @@ def add_digest_arguments(parser: argparse.ArgumentParser, *, archive: bool = Fal
     parser.add_argument("-k", "--checkpoint", type=Path, help="续传检查点路径；默认按时间窗口和筛选条件存入运行时目录")
     parser.add_argument("-C", "--cache", type=Path, help="SQLite 路径；报告默认共享列表库，归档默认按账号隔离的档案库")
     parser.add_argument("-F", "--fresh", action="store_true", help="忽略可复用覆盖和旧检查点，重新联网采集；不删除历史档案")
+    parser.add_argument("--verify-cache", action="store_true", help="完成时执行 SQLite 全库完整性校验；默认跳过")
     parser.add_argument("-o", "--output", type=Path, help="输出文件；报告默认 reports/ 下的 Markdown，归档指定后另存 JSON 摘要")
 
 

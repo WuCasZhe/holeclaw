@@ -5,14 +5,16 @@ import time
 try:
     from holeclaw_domain import CliError
     from holeclaw_sink import RunSink
+    from holeclaw_protocol import SinkMessage
 except ModuleNotFoundError:
     from scripts.holeclaw_domain import CliError
     from scripts.holeclaw_sink import RunSink
+    from scripts.holeclaw_protocol import SinkMessage
 
 
 class ArchiveSink(RunSink):
     def __init__(self, archive, checkpoint, checkpoint_path, min_comments, min_favorites,
-                 match_mode='all', *, source_cache=None, progress_seconds=0, progress_pages=1):
+                 match_mode='all', *, source_cache=None, progress_seconds=300, progress_pages=0):
         super().__init__(source_cache or archive, checkpoint, checkpoint_path,
                          min_comments, min_favorites, match_mode)
         self.archive = archive
@@ -44,7 +46,8 @@ class ArchiveSink(RunSink):
                  self.metrics.get('image_receipts', 0))
         now = time.monotonic()
         if state != self.last_reported_state and (force
-                or self.checkpoint['total_pages'] - self.last_reported_pages >= self.progress_pages
+                or (self.progress_pages and
+                    self.checkpoint['total_pages'] - self.last_reported_pages >= self.progress_pages)
                 or (self.progress_seconds and now - self.last_reported_at >= self.progress_seconds)):
             print(f"档案阶段进度：列表累计 {self.checkpoint['total_pages']} 页，"
                   f"评论已保存 {self.comment_chunks} 批，复用评论 {self.reused_posts} 帖，"
@@ -74,6 +77,7 @@ class ArchiveSink(RunSink):
             'archive_media_plan': self.ingest_media,
             'archive_media_file': self.ingest_media,
             'archive_media_unavailable': self.ingest_media,
+            'archive_post_unavailable': self.ingest_unavailable,
         }
         if kind in handlers:
             if payload.get('archive_run') != self.checkpoint['created_at']:
@@ -84,7 +88,7 @@ class ArchiveSink(RunSink):
         if self.source_cache is None:
             raise CliError('Archive list collection requires a separate source cache.')
         if payload.get('archive_cached'):
-            payload = dict(payload, rows=[], scanned=0, favorite_unavailable=[], matched_pids=[])
+            payload = dict(payload, rows=[], scanned=0, favorite_unavailable=[], favorite_deferred_pids=[], matched_pids=[])
         result = super().dispatch(kind, payload)
         self.report_progress(force=bool(payload.get('terminal')))
         return result
@@ -93,11 +97,12 @@ class ArchiveSink(RunSink):
         page = payload.get('page')
         if type(page) is not int or not 1 <= page <= self.checkpoint.get('archive_cached_pages', 0):
             raise CliError('Invalid cached page.')
-        posts = self.archive.candidate_page(self.checkpoint['created_at'], page)
-        expected = min(500, self.checkpoint['cached_posts'] - (page - 1) * 500)
-        if len(posts) != expected:
-            raise CliError('Cached candidate snapshot is missing. Restore it or use --fresh.')
-        return {'posts': posts}
+        result = self.archive.cached_work_page(self.checkpoint, page)
+        self.reused_posts += result['reused']
+        self.add_metric('reused_posts', result['reused'])
+        self.add_metric('locally_reused_posts', result['reused'])
+        self.report_progress()
+        return result
 
     def ingest_prepare(self, payload):
         posts = payload.get('posts')
@@ -109,7 +114,8 @@ class ArchiveSink(RunSink):
         resumes = self.archive.prepare_posts(posts, payload['archive_run'], self.checkpoint.get('fresh', False))
         self.add_metric('prepare_ms', round((time.perf_counter() - started) * 1000))
         self.add_metric('prepare_batches')
-        reused = sum(bool(row['complete']) for row in resumes.values())
+        reused = sum(bool(row['complete']) and not row.get('empty_completed') for row in resumes.values())
+        self.add_metric('empty_posts_completed', sum(bool(row.get('empty_completed')) for row in resumes.values()))
         self.reused_posts += reused
         self.add_metric('reused_posts', reused)
         for post in posts:
@@ -122,6 +128,12 @@ class ArchiveSink(RunSink):
         post = payload['post']
         return self.archive.resume_comments(post['pid'], payload['archive_run'], post['reply'],
                                             self.checkpoint.get('fresh', False))
+
+    def ingest_unavailable(self, payload):
+        self.archive.record_unavailable(payload['post'], payload['archive_run'])
+        self.record_post_date(int(payload['post']['timestamp']))
+        self.add_metric('unavailable_posts')
+        self.report_progress()
 
     def ingest_comment_chunk(self, payload):
         started = time.perf_counter()
@@ -139,7 +151,7 @@ class ArchiveSink(RunSink):
             raise CliError('Image extraction is not enabled.')
         post = payload['post']
         if payload.get('archive_media_unavailable'):
-            media.unavailable(str(post['pid']), 'post_not_found')
+            media.unavailable(str(post['pid']), 'post_not_found', post['reply'])
         elif payload.get('archive_post_media'):
             media.record_post(post)
         elif payload.get('archive_media_plan'):
@@ -153,4 +165,29 @@ class ArchiveSink(RunSink):
         self.record_post_date(int(post['timestamp']))
         self.report_progress()
 
+    def ingest_media_stream(self, raw, stream, length):
+        message = SinkMessage.decode(raw, self.checkpoint['created_at'])
+        if message.kind != 'archive_media_file' or raw.get('schema_version') != 3:
+            raise CliError('Invalid binary image message.')
+        payload = message.payload
+        if any(key in payload for key in ('data', 'binary_sha256', 'status')):
+            raise CliError('Invalid binary image payload.')
+        media = self.archive.media
+        with self.lock:
+            if self.cancel_event.is_set():
+                raise CliError('Collector cancelled.')
+            self.validate_post(payload.get('post') or {})
+            if not media:
+                raise CliError('Image extraction is not enabled.')
+            media.validate_download(str(payload['post']['pid']), payload.get('media_key'))
+        with media.receive(stream, length, payload.get('mime', '')) as prepared:
+            # Include the bytes in request identity without serializing them.
+            envelope = dict(raw, payload=dict(raw['payload'], binary_sha256=prepared['digest']))
+            return self.ingest(envelope, prepared_media=prepared)
 
+    def publish_media(self, message, prepared):
+        payload = message.payload
+        self.archive.media.save_received(str(payload['post']['pid']), payload['media_key'], prepared)
+        self.add_metric('image_receipts')
+        self.record_post_date(int(payload['post']['timestamp']))
+        self.report_progress()

@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 try:
     from holeclaw_protocol import ReceiptBook, SinkMessage
@@ -70,7 +70,7 @@ class RunSink:
         return (f"帖子最后日期（最旧）：{datetime.fromtimestamp(timestamp, SHANGHAI):%Y-%m-%d %H:%M}"
                 if timestamp else "帖子最后日期：暂无")
 
-    def ingest(self, payload: dict) -> dict | None:
+    def ingest(self, payload: dict, *, prepared_media=None) -> dict | None:
         message = SinkMessage.decode(payload, self.checkpoint['created_at'])
         with self.lock:
             if self.cancel_event.is_set():
@@ -78,9 +78,16 @@ class RunSink:
             found, receipt = self.receipts.lookup(message)
             if found:
                 return receipt
-            receipt = self.dispatch(message.kind, message.payload)
+            receipt = (self.dispatch(message.kind, message.payload) if prepared_media is None
+                       else self.publish_media(message, prepared_media))
             self.receipts.remember(message, receipt)
             return receipt
+
+    def ingest_media_stream(self, payload, stream, length):
+        raise CliError('Image upload requires an archive sink.')
+
+    def publish_media(self, message, prepared):
+        raise CliError('Image upload requires an archive sink.')
 
     def dispatch(self, kind: str, payload: dict):
         if kind not in ('list_chunk', 'telemetry_final'):
@@ -132,6 +139,12 @@ class RunSink:
             rows = payload.get("rows") or []
             matched_pids = payload.get("matched_pids") or []
             unavailable = payload.get("favorite_unavailable") or []
+            deferred = payload.get('favorite_deferred_pids') or []
+            if not isinstance(deferred, list) or not all(isinstance(pid, str) and pid for pid in deferred):
+                raise CliError('Invalid deferred favorite IDs.')
+            deferred_pids = set(deferred)
+            if len(deferred_pids) != len(deferred):
+                raise CliError('Duplicate deferred favorite IDs.')
             if not isinstance(matched_pids, list) or not all(
                 isinstance(pid, str) and pid for pid in matched_pids
             ):
@@ -147,21 +160,28 @@ class RunSink:
                 raise CliError("Collector returned invalid unavailable favorite metadata.")
             if "" in match_pids or not match_pids.issubset(row_pids):
                 raise CliError("Collector returned matches outside its cache rows.")
+            rows_by_pid = {str(row.get('pid', '')): row for row in rows}
             missing_favorite_pids = {
-                str(row.get("pid", "")) for row in rows if row.get("favorites") is None
+                str(row.get("pid", "")) for row in rows_by_pid.values() if row.get("favorites") is None
             }
             report_start = self.checkpoint["start_timestamp"]
             report_end = self.checkpoint["end_timestamp"]
             missing_report_favorites = {
-                str(row.get("pid", "")) for row in rows
+                str(row.get("pid", "")) for row in rows_by_pid.values()
                 if row.get("favorites") is None
                 and report_start <= int(row.get("timestamp", 0)) < report_end
             }
             if not unavailable_pids.issubset(missing_favorite_pids):
                 raise CliError("Collector marked a known favorite count as unavailable.")
+            if deferred_pids and (not deferred_pids.issubset(missing_report_favorites)
+                    or deferred_pids & unavailable_pids
+                    or self.filter_spec.match_mode != 'all'
+                    or self.filter_spec.min_comments is None or self.filter_spec.min_favorites is None
+                    or any(int(rows_by_pid[pid]['reply']) > self.filter_spec.min_comments for pid in deferred_pids)):
+                raise CliError('Deferred favorite lookup could change the requested matches.')
             if (
                 self.filter_spec.min_favorites is not None
-                and not missing_report_favorites.issubset(unavailable_pids)
+                and not missing_report_favorites.issubset(unavailable_pids | deferred_pids)
             ):
                 raise CliError("Collector omitted favorite counts or availability metadata.")
 
@@ -190,7 +210,7 @@ class RunSink:
                 (time.perf_counter() - cache_started) * 1000
             )
             merge_telemetry(self.checkpoint["telemetry"], chunk_telemetry)
-            if missing_report_favorites and self.filter_spec.min_favorites is None:
+            if deferred_pids or (missing_report_favorites and self.filter_spec.min_favorites is None):
                 self.checkpoint["favorites_complete"] = False
             self.state.commit_pages(dict(payload, end_page=end_page, pages=pages, scanned=scanned),
                                     validated_match_pids)
@@ -247,6 +267,7 @@ class SinkServer:
         self.server_cancel = sink.cancel
         token = secrets.token_urlsafe(24)
         sink_ref = sink
+        upload_slots = threading.BoundedSemaphore(2)
 
         class Handler(BaseHTTPRequestHandler):
             def handle(self) -> None:
@@ -260,7 +281,7 @@ class SinkServer:
             def _cors(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", SITE_ORIGIN)
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "content-type")
+                self.send_header("Access-Control-Allow-Headers", "content-type, x-holeclaw-message")
                 self.send_header("Access-Control-Allow-Private-Network", "true")
                 self.send_header("Access-Control-Max-Age", "3600")
 
@@ -294,7 +315,7 @@ class SinkServer:
                 supplied = parse_qs(parsed.query).get("token", [""])[0]
                 origin = self.headers.get("Origin", "")
                 if (
-                    parsed.path != "/ingest"
+                    parsed.path not in ("/ingest", "/media")
                     or not hmac.compare_digest(supplied, token)
                     or origin != SITE_ORIGIN
                 ):
@@ -303,12 +324,26 @@ class SinkServer:
                     self.end_headers()
                     return
                 try:
-                    self.connection.settimeout(2)
+                    self.connection.settimeout(10 if parsed.path == '/media' else 2)
                     length = int(self.headers.get("Content-Length", "0"))
-                    if length <= 0 or length > 64 * 1024 * 1024:
+                    if length < 0 or (length == 0 and parsed.path != '/media') or length > 64 * 1024 * 1024:
                         raise CliError("Invalid local cache payload size.")
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                    receipt = sink_ref.ingest(payload)
+                    if parsed.path == '/media':
+                        if not upload_slots.acquire(blocking=False):
+                            self.send_response(503)
+                            self._cors()
+                            self.end_headers()
+                            return
+                        try:
+                            raw = self.headers.get('X-Holeclaw-Message', '')
+                            if not raw or len(raw) > 16 * 1024:
+                                raise CliError('Invalid image metadata.')
+                            receipt = sink_ref.ingest_media_stream(json.loads(unquote(raw)), self.rfile, length)
+                        finally:
+                            upload_slots.release()
+                    else:
+                        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                        receipt = sink_ref.ingest(payload)
                     body = json.dumps({"ok": True, **(receipt or {})}).encode("utf-8")
                     self.send_response(200)
                 except Exception as error:

@@ -108,7 +108,7 @@ async function nestedArchiveRequestsShareEightSlots() {
   assert.equal(first.sinkPayloads.find(p => p.archive_media_file).data, 'iVBORw0KGgo=');
   assert.equal((await collect('reuse')).remote.length, 1, 'known images and complete comments need no detail calls');
   const deleted = await collect('deleted');
-  assert.ok(deleted.sinkPayloads.some(p => p.archive_media_unavailable));
+  assert.ok(deleted.sinkPayloads.some(p => p.archive_post_unavailable));
   assert.equal(deleted.remote.length, 2);
   assert.equal((await collect('missing_file')).sinkPayloads.find(p => p.archive_media_file).status, 'unavailable');
   await assert.rejects(collect('expired'), /Authentication expired/);

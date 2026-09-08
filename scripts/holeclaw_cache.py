@@ -159,10 +159,43 @@ class CacheStore:
                     favorites,
                     str(row.get("type") or "text"),
                     str(row.get("text") or ""),
-                    observed_at,
+                    int(row.get('observed_at', observed_at) or 0),
                 )
             )
         with self.transaction():
+            existing = {}
+            for offset in range(0, len(values), 500):
+                pids = [value[0] for value in values[offset:offset + 500]]
+                existing.update((row['pid'], dict(row)) for row in self.connection.execute(
+                    f'''SELECT p.*, u.pid AS favorite_unavailable FROM posts p
+                        LEFT JOIN favorite_unavailable u USING(pid)
+                        WHERE p.pid IN ({','.join('?' for _ in pids)})''', pids))
+            changed = []
+            clear_unavailable = set()
+            fields = ('pid', 'timestamp', 'reply', 'favorites', 'type', 'text', 'observed_at')
+            for value in values:
+                previous = existing.get(value[0])
+                merged = list(value)
+                if previous:
+                    if merged[6] < previous['observed_at']:
+                        # Historical list snapshots can fill missing fields, but
+                        # must not replace newer detail text or engagement counts.
+                        merged = [previous[key] for key in fields]
+                        if merged[3] is None:
+                            merged[3] = value[3]
+                        if not merged[5]:
+                            merged[5] = value[5]
+                    if merged[3] is None:
+                        merged[3] = previous['favorites']
+                    if not merged[5]:
+                        merged[5] = previous['text']
+                    # Replaying an older observation must not refresh its age.
+                    merged[6] = max(merged[6], previous['observed_at'])
+                    if previous['favorite_unavailable'] and merged[3] is not None:
+                        clear_unavailable.add(value[0])
+                if previous is None or tuple(merged) != tuple(previous[key] for key in fields):
+                    changed.append(tuple(merged))
+                existing[value[0]] = dict(zip(fields, merged), favorite_unavailable=None)
             self.connection.executemany(
                 """
                 INSERT INTO posts(
@@ -180,21 +213,28 @@ class CacheStore:
                     text=CASE WHEN excluded.text <> '' THEN excluded.text ELSE posts.text END,
                     observed_at=excluded.observed_at
                 """,
-                values,
+                changed,
             )
-            input_pids = [value[0] for value in values]
-            if input_pids:
-                self.connection.executemany(
-                    """
-                    DELETE FROM favorite_unavailable
-                    WHERE pid = ?
-                      AND EXISTS (
-                          SELECT 1 FROM posts
-                          WHERE posts.pid = ? AND posts.favorites IS NOT NULL
-                      )
-                    """,
-                    ((pid, pid) for pid in input_pids),
-                )
+            # Missing-post markers are unusual, but can predate the first row.
+            new_known = [v[0] for v in changed if v[3] is not None]
+            cleanup = list(clear_unavailable.union(new_known))
+            for offset in range(0, len(cleanup), 500):
+                pids = cleanup[offset:offset + 500]
+                self.connection.execute(
+                    f"DELETE FROM favorite_unavailable WHERE pid IN ({','.join('?' for _ in pids)})", pids)
+
+    def rows_by_pid(self, table, pids):
+        """Read internal state tables in bounded batches (also fits older SQLite limits)."""
+        if table not in ('comment_scans', 'media_scans', 'posts'):
+            raise ValueError('Unsupported state table.')
+        pids = list(dict.fromkeys(str(pid) for pid in pids))
+        result = {}
+        with self.lock:
+            for offset in range(0, len(pids), 500):
+                batch = pids[offset:offset + 500]
+                result.update((row['pid'], row) for row in self.connection.execute(
+                    f"SELECT * FROM {table} WHERE pid IN ({','.join('?' for _ in batch)})", batch))
+        return result
     def record_favorite_unavailable(
         self, rows: list[dict]
     ) -> None:

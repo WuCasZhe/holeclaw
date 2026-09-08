@@ -126,6 +126,30 @@ async (page) => {
             if (!response.ok || JSON.parse(await response.text()).cancelled) controller.abort();
           }).catch(() => { if (!finished) controller.abort(); }) : null;
         try {
+        // Keep cancellation and per-attempt deadlines separate: a timeout may
+        // retry, whereas cancelling the collection must stop every worker.
+        const withDeadline = async (operation, milliseconds = 60_000, parent = controller.signal) => {
+          const attempt = new AbortController();
+          const deadline = AbortSignal.timeout(milliseconds);
+          const abort = () => attempt.abort(parent.aborted ? parent.reason : deadline.reason);
+          parent.addEventListener('abort', abort, {once: true});
+          deadline.addEventListener('abort', abort, {once: true});
+          if (parent.aborted) abort();
+          let rejectAbort;
+          const aborted = new Promise((_, reject) => {
+            rejectAbort = () => reject(attempt.signal.reason);
+            attempt.signal.addEventListener('abort', rejectAbort, {once: true});
+            if (attempt.signal.aborted) rejectAbort();
+          });
+          try {
+            return await Promise.race([aborted, operation(attempt.signal)]);
+          } finally {
+            parent.removeEventListener('abort', abort);
+            deadline.removeEventListener('abort', abort);
+            attempt.signal.removeEventListener('abort', rejectAbort);
+            attempt.abort();
+          }
+        };
         const sleep = (milliseconds) => new Promise((resolve, reject) => {
           const signal = controller.signal;
           if (signal.aborted) { reject(new Error('Collector cancelled.')); return; }
@@ -177,7 +201,7 @@ async (page) => {
 
           const waitForSharedCooldown = async () => {
             while (cooldownUntil > clock.now()) {
-              const milliseconds = cooldownUntil - clock.now();
+              const milliseconds = Math.min(60_000, cooldownUntil - clock.now());
               telemetry.add('retry_backoff_ms', milliseconds);
               await sleep(milliseconds);
             }
@@ -236,44 +260,42 @@ async (page) => {
                 activeRequests += 1;
                 telemetry.observeMax('max_in_flight', activeRequests);
                 try {
-                  const response = await fetch(url, { headers: authHeaders, signal: signal });
-                  if (binary && response.status === 200 && !response.headers.get('content-type')?.includes('json')) {
-                    const reader = response.body.getReader();
-                    const chunks = [];
-                    let size = 0;
-                    while (true) {
-                      signal.throwIfAborted();
-                      const {value, done} = await reader.read();
-                      if (done) break;
-                      size += value.length;
-                      if (size > 20 * 1024 * 1024) {
-                        await reader.cancel();
-                        throw Object.assign(new Error('Image exceeds the 20 MiB limit.'), {permanent: true});
+                  await withDeadline(async requestSignal => {
+                    const response = await fetch(url, { headers: authHeaders, signal: requestSignal });
+                    if (binary && response.status === 200 && !response.headers.get('content-type')?.includes('json')) {
+                      const reader = response.body.getReader();
+                      const chunks = [];
+                      let size = 0;
+                      while (true) {
+                        signal.throwIfAborted();
+                        const {value, done} = await withDeadline(() => reader.read(), 30_000, requestSignal);
+                        if (done) break;
+                        size += value.length;
+                        if (size > 20 * 1024 * 1024) {
+                          await reader.cancel();
+                          throw Object.assign(new Error('Image exceeds the 20 MiB limit.'), {permanent: true});
+                        }
+                        chunks.push(value);
                       }
-                      chunks.push(value);
+                      telemetry.add('image_bytes', size);
+                      result = {status: 200, file: {blob: new Blob(chunks), mime: response.headers.get('content-type') || ''}};
+                    } else {
+                      const text = await response.text();
+                      telemetry.add('response_chars', text.length);
+                      let json = null;
+                      try {
+                        json = JSON.parse(text);
+                      } catch {
+                        // Report a short preview only; never expose request headers.
+                      }
+                      result = {
+                        status: response.status,
+                        retryAfter: response.headers.get('retry-after'),
+                        json,
+                        preview: json ? '' : text.slice(0, 80),
+                      };
                     }
-                    let raw = '';
-                    for (const chunk of chunks) for (let i = 0; i < chunk.length; i += 8192) {
-                      raw += String.fromCharCode(...chunk.subarray(i, i + 8192));
-                    }
-                    telemetry.add('image_bytes', size);
-                    result = {status: 200, file: {data: btoa(raw), mime: response.headers.get('content-type') || ''}};
-                  } else {
-                  const text = await response.text();
-                  telemetry.add('response_chars', text.length);
-                  let json = null;
-                  try {
-                    json = JSON.parse(text);
-                  } catch {
-                    // Report a short preview only; never expose request headers.
-                  }
-                  result = {
-                    status: response.status,
-                    retryAfter: response.headers.get('retry-after'),
-                    json,
-                    preview: json ? '' : text.slice(0, 80),
-                  };
-                  }
+                  });
                 } catch (error) {
                   signal.throwIfAborted();
                   if (error.permanent) throw error;
@@ -299,8 +321,7 @@ async (page) => {
                 }
                 if (!transient || attempt === 2) break;
                 const serverDelay = retryAfterMilliseconds(result.retryAfter);
-                const backoff = Math.max(serverDelay, 15_000 * 2 ** attempt);
-                const backoffMilliseconds = Math.min(60_000, backoff);
+                const backoffMilliseconds = Math.max(serverDelay, Math.min(60_000, 15_000 * 2 ** attempt));
                 cooldownUntil = Math.max(cooldownUntil, clock.now() + backoffMilliseconds);
               } finally {
                 releaseRequestSlot();
@@ -352,21 +373,32 @@ async (page) => {
 
         const createSinkClient = ({fetch, sleep, signal, url, runId}) => {
           let nextRequestId = 0;
-          const send = async (kind, payload) => {
+          const send = async (kind, payload, blob = null) => {
             // Freeze the body: in-flight prefetch may update telemetry during retry.
             const body = JSON.stringify({schema_version: 3, kind, run_id: runId,
                 request_id: ++nextRequestId, payload});
             let lastError = null;
             for (let attempt = 0; attempt < 3; attempt += 1) {
               try {
-                const response = await fetch(url, {
-                  signal: signal,
-                  method: 'POST',
-                  headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-                  body,
+                const receipt = await withDeadline(async requestSignal => {
+                  const response = await fetch(blob ? url.replace('/ingest?', '/media?') : url, {
+                    signal: requestSignal,
+                    method: 'POST',
+                    headers: blob ? {'Content-Type': 'application/octet-stream',
+                      'X-Holeclaw-Message': encodeURIComponent(body)} : { 'Content-Type': 'text/plain;charset=UTF-8' },
+                    body: blob || body,
+                  });
+                  const text = await response.text();
+                  let result;
+                  try { result = JSON.parse(text); } catch {
+                    throw new Error(`Local cache sink returned HTTP ${response.status}: invalid response`);
+                  }
+                  if (!response.ok || !result || result.ok === false) {
+                    throw new Error(`Local cache sink returned HTTP ${response.status}: ${result?.error || 'request failed'}`);
+                  }
+                  return result;
                 });
-                if (response.ok) return JSON.parse(await response.text());
-                lastError = new Error(`Local cache sink returned HTTP ${response.status}.`);
+                return receipt;
               } catch (error) {
                 signal.throwIfAborted();
                 lastError = error;
@@ -390,6 +422,7 @@ async (page) => {
         let pendingRows = [];
         let pendingMatchedPids = new Set();
         let pendingUnavailableByPid = new Map();
+        let pendingDeferredPids = new Set();
         const matchesThresholds = (post) => {
           const conditions = [];
           if (minComments !== null) conditions.push(post.reply > minComments);
@@ -403,6 +436,19 @@ async (page) => {
         const pageLimit = archiveCacheOnly ? archiveCachedPages + 1 : hasPageLimit
           ? startPage + maxPages
           : Number.POSITIVE_INFINITY;
+        let archiveRevision = 0, expiredRevision = -1;
+        const postRevisions = new Map();
+        const postFinished = pid => {
+          postRevisions.delete(pid);
+          postRevisions.set(pid, ++archiveRevision);
+          if (postRevisions.size > 8192) {
+            const [oldPid, revision] = postRevisions.entries().next().value;
+            postRevisions.delete(oldPid);
+            expiredRevision = revision;
+          }
+        };
+        const resumeStillValid = (pid, revision) => revision > expiredRevision &&
+          (postRevisions.get(pid) || 0) <= revision;
         const createListPipeline = ({getConcurrency, requestJson, pacingSleep, sendToSink}) => {
           const maxBufferedPages = Math.max(requestConcurrency * 2, requestConcurrency);
           const pageBuffer = new Map();
@@ -416,10 +462,12 @@ async (page) => {
           const launchListPage = (pageNumber) => {
             const tracked = (async () => {
               if (archive && pageNumber <= archiveCachedPages) {
+                const revision = archiveRevision;
                 const cached = await sendToSink('archive_source', {
                    page: pageNumber});
                 if (!Array.isArray(cached.posts)) throw new Error('Invalid cached post batch.');
-                return { posts: cached.posts };
+                return { posts: cached.posts, sourceCount: cached.source_count,
+                         sourceOldest: cached.oldest, cachedResumes: cached.resumes, revision };
               }
               await pacingSleep();
               const listJson = await requestJson(
@@ -490,7 +538,7 @@ async (page) => {
 
         // Share post workers across a bounded window of list pages. Duplicate
         // PIDs are serialized so two snapshots cannot race their comment cursor.
-        const createPostQueue = ({getConcurrency, signal}) => {
+        const createPostQueue = ({getConcurrency, signal, onComplete = () => {}}) => {
           const postQueue = [];
           const postWorkByPid = new Map();
           let activePostWorkers = 0;
@@ -512,7 +560,11 @@ async (page) => {
             const work = previous.then(() => new Promise((resolve, reject) => {
               postQueue.push({worker, resolve, reject});
               drainPostQueue();
-            }));
+            })).then(async result => {
+              // Release the worker after text work, but retain the PID barrier
+              // and page completion barrier until its image stage finishes.
+              if (result?.completion) await result.completion;
+            }).finally(() => onComplete(pid));
             postWorkByPid.set(pid, work);
             const forget = () => { if (postWorkByPid.get(pid) === work) postWorkByPid.delete(pid); };
             work.then(forget, forget);
@@ -521,16 +573,22 @@ async (page) => {
 
           return {schedule: schedulePost, settle: () => Promise.allSettled([...postWorkByPid.values()])};
         };
-        const posts = createPostQueue({getConcurrency: () => scheduler.concurrency, signal: controller.signal});
+        const posts = createPostQueue({getConcurrency: () => scheduler.concurrency, signal: controller.signal,
+          onComplete: postFinished});
         const schedulePost = posts.schedule;
+        // Bound the entire download/upload lifetime, including slow local disks.
+        const imageTransfers = createPostQueue({getConcurrency: () => 2, signal: controller.signal});
+        const mediaPosts = createPostQueue({getConcurrency: () => requestConcurrency, signal: controller.signal});
 
         const createPostArchiver = ({requestJson, pacingSleep, sendToSink, schedulePost, getConcurrency}) => {
           let nextMediaPlan = 0;
-          const processListPage = async (posts, cachedPage) => {
+          const processListPage = async (posts, cachedPage, cachedResumes, cachedRevision) => {
             const pendingRows = [];
             const pendingUnavailableByPid = new Map();
             const rowsByPid = new Map();
             const detailsFetchedPids = new Set();
+            const preparedRows = new Map();
+            const deferredFavorites = new Set();
             for (const post of posts) {
               const row = {
                 pid: String(post.pid),
@@ -539,24 +597,32 @@ async (page) => {
                 favorites: nonNegativeInteger(post.likenum),
                 type: post.type || 'text',
                 text: post.text || '',
+                ...(cachedPage && Number.isInteger(post.observed_at) ? {observed_at: post.observed_at} : {}),
                 ...(extractImages && Object.hasOwn(post, 'media_ids') ? {media_ids: mediaIds(post.media_ids)} : {}),
               };
               rowsByPid.set(row.pid, row);
               pendingRows.push(row);
+              if (cachedResumes?.[row.pid]) preparedRows.set(row.pid, JSON.stringify(row));
             }
 
             const fetchAndApplyDetail = async (post, favoritesFallback) => {
               await pacingSleep();
               const detailJson = await requestJson(
                 `/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`,
-                `detail #${post.pid}`,
+                `detail #${post.pid}`, false, archive,
               );
+              if (detailJson.unavailable) {
+                post.unavailable = true;
+                if (post.favorites === null) pendingUnavailableByPid.set(post.pid, {pid: post.pid, reason: 'post_not_found'});
+                return;
+              }
               const hole = detailJson?.data?.hole || {};
               if (extractImages) post.media_ids = mediaIds(hole.media_ids);
               post.text = hole.text || post.text;
               post.type = hole.type || post.type;
               post.reply = Number(hole.reply ?? post.reply);
               post.favorites = nonNegativeInteger(hole.likenum, favoritesFallback);
+              delete post.observed_at;
               detailsFetchedPids.add(post.pid);
               if (minFavorites !== null && post.favorites === null) {
                 pendingUnavailableByPid.set(post.pid, {
@@ -569,7 +635,13 @@ async (page) => {
             const missingFavorites = [...rowsByPid.values()].filter(
               (post) => !cachedPage && minFavorites !== null && post.favorites === null
                 && post.timestamp >= reportStartTimestamp && post.timestamp < endTimestamp,
-            );
+            ).filter(post => {
+              if (matchMode === 'all' && minComments !== null && post.reply <= minComments) {
+                deferredFavorites.add(post.pid);
+                return false;
+              }
+              return true;
+            });
             await mapLimit(missingFavorites, getConcurrency(), async (post) => {
               await fetchAndApplyDetail(post, null);
             });
@@ -591,19 +663,35 @@ async (page) => {
             });
             pageMatches = pageMatches.filter(matchesThresholds);
             if (archive) {
-              const prepared = pageMatches.length ? await sendToSink('archive_prepare', {posts: pageMatches,
-              }) : {resumes: {}};
+              const states = new Map();
+              const needsPrepare = pageMatches.filter(post => {
+                if (preparedRows.get(post.pid) === JSON.stringify(post)) {
+                  states.set(post.pid, {resume: cachedResumes[post.pid], revision: cachedRevision});
+                  return false;
+                }
+                return true;
+              });
+              const revision = archiveRevision;
+              const prepared = needsPrepare.length ? await sendToSink('archive_prepare', {posts: needsPrepare}) : {resumes: {}};
+              for (const post of needsPrepare) states.set(post.pid, {resume: prepared.resumes?.[post.pid], revision});
               // One resume lookup per post batch, then bounded comment chunks.
-              await Promise.all(pageMatches.map((post) => schedulePost(post.pid, async () => {
-                const resume = prepared.resumes?.[post.pid];
+              const workOrder = [...pageMatches].sort((a, b) => Math.min(b.reply, 1000) - Math.min(a.reply, 1000));
+              await Promise.all(workOrder.map((post) => schedulePost(post.pid, async () => {
+                const state = states.get(post.pid);
+                const resume = resumeStillValid(post.pid, state.revision) ? state.resume :
+                  (await sendToSink('archive_prepare', {posts: [post]})).resumes?.[post.pid];
                 if (!resume) throw new Error(`Missing archive resume state for #${post.pid}`);
-                if (extractImages && resume.unavailable) return;
+                if (resume.unavailable) return;
+                if (post.unavailable) {
+                  await sendToSink('archive_post_unavailable', {post});
+                  return;
+                }
                 if (extractImages && (!resume.post_known || Object.hasOwn(post, 'media_ids'))) {
                   if (!Object.hasOwn(post, 'media_ids')) {
                     await pacingSleep();
                     const detail = await requestJson(`/chapi/api/v3/hole/one?pid=${encodeURIComponent(post.pid)}&comment_stream=1`, `detail image metadata #${post.pid}`, false, true);
                     if (detail.unavailable) {
-                      await sendToSink('archive_media_unavailable', {post});
+                      await sendToSink('archive_post_unavailable', {post});
                       return;
                     }
                     if (!detail?.data?.hole) throw new Error(`Missing image metadata for #${post.pid}`);
@@ -622,10 +710,10 @@ async (page) => {
                   if (post.reply !== 0 && !alreadyCapped) await pacingSleep();
                   const data = post.reply === 0 || alreadyCapped ? {data: {list: []}} : await requestJson(
                     `/chapi/api/v3/comment/list?pid=${encodeURIComponent(post.pid)}&page=${commentPage}&limit=${commentPageSize}&sort=0&comment_stream=1`,
-                    `detail comments #${post.pid} page ${commentPage}`, false, extractImages,
+                    `detail comments #${post.pid} page ${commentPage}`, false, true,
                   );
                   if (data.unavailable) {
-                    await sendToSink('archive_media_unavailable', {post});
+                    await sendToSink('archive_post_unavailable', {post});
                     return;
                   }
                   const comments = data?.data?.list;
@@ -666,22 +754,28 @@ async (page) => {
                 }
                 }
                 if (downloadImages) {
-                  while (true) {
-                    const planned = await sendToSink('archive_media_plan', {
-                      plan_id: String(++nextMediaPlan),  post});
-                    if (!planned.images?.length) break;
-                    await mapLimit(planned.images, getConcurrency(), async (item) => {
-                      await pacingSleep();
-                      const file = await requestJson(item.url, `image ${item.media_key}`, true);
-                      await sendToSink('archive_media_file', {
-                        post, media_key: item.media_key, ...file});
-                    });
-                  }
+                  const completion = mediaPosts.schedule(post.pid, async () => {
+                    while (true) {
+                      const planned = await sendToSink('archive_media_plan', {
+                        plan_id: String(++nextMediaPlan),  post});
+                      if (!planned.images?.length) break;
+                      await Promise.all(planned.images.map(item => imageTransfers.schedule(item.media_key, async () => {
+                        await pacingSleep();
+                        const file = await requestJson(item.url, `image ${item.media_key}`, true);
+                        const {blob, ...metadata} = file;
+                        await sendToSink('archive_media_file', {
+                          post: {pid: post.pid, timestamp: post.timestamp, reply: post.reply, favorites: post.favorites},
+                          media_key: item.media_key, ...metadata}, blob);
+                      })));
+                    }
+                  });
+                  completion.catch(() => {}); // The PID/page barrier below owns errors.
+                  return {completion};
                 }
               })));
             }
             return {rows: pendingRows, matches: archive ? [] : pageMatches.map(post => post.pid),
-              unavailable: [...pendingUnavailableByPid.values()]};
+              unavailable: [...pendingUnavailableByPid.values()], deferred: [...deferredFavorites]};
           };
 
           return {processPage: processListPage};
@@ -708,7 +802,7 @@ async (page) => {
             controller.signal.throwIfAborted();
             if (pageFailure) break;
             const cachedPage = archive && pageNumber <= archiveCachedPages;
-            const {posts} = await listPipeline.take(pageNumber);
+            const {posts, sourceCount, sourceOldest, cachedResumes, revision} = await listPipeline.take(pageNumber);
             controller.signal.throwIfAborted();
             // Exact PID-set repeats/cycles are abnormal; partial overlap is normal
             // on a changing feed. Keep only a bounded recent-page window.
@@ -720,14 +814,14 @@ async (page) => {
               recentFingerprints.push(fingerprint);
               if (recentFingerprints.length > 32) recentFingerprints.shift();
             }
-            const oldest = Number(posts.at(-1)?.timestamp || 0);
-            const exhausted = !posts.length;
+            const oldest = Number(sourceOldest ?? posts.at(-1)?.timestamp ?? 0);
+            const exhausted = (sourceCount ?? posts.length) === 0;
             const reached = exhausted || (!cachedPage && oldest > 0 && oldest < scanStartTimestamp)
               || (archiveCacheOnly && pageNumber === archiveCachedPages);
             const terminal = reached || pageNumber + 1 === pageLimit;
             if (terminal) listPipeline.stop();
-            const work = postArchiver.processPage(posts, cachedPage).then(
-              result => ({...result, cachedPage, oldest, scanned: posts.length,
+            const work = postArchiver.processPage(posts, cachedPage, cachedResumes, revision).then(
+              result => ({...result, cachedPage, oldest, scanned: sourceCount ?? posts.length,
                 reachedStart: reached, feedExhausted: exhausted, terminal}),
               error => { pageFailure = true; listPipeline.stop(); wakePipeline(); return {error}; });
             processingPages.set(pageNumber, work);
@@ -744,6 +838,8 @@ async (page) => {
           await producer;
           await Promise.all([...processingPages.values()]);
           await posts.settle();
+          await mediaPosts.settle();
+          await imageTransfers.settle();
           await listPipeline.settle();
         };
 
@@ -763,6 +859,11 @@ async (page) => {
             pendingRows.push(...result.rows);
             for (const pid of result.matches) pendingMatchedPids.add(pid);
             for (const row of result.unavailable) pendingUnavailableByPid.set(row.pid, row);
+            const deferred = new Set(result.deferred);
+            for (const row of result.rows) {
+              if (deferred.has(row.pid)) pendingDeferredPids.add(row.pid);
+              else pendingDeferredPids.delete(row.pid);
+            }
             reachedStart = result.reachedStart;
             feedExhausted = result.feedExhausted;
             if (terminal) {
@@ -793,6 +894,7 @@ async (page) => {
                 rows: cachedPage ? [] : pendingRows,
                 matched_pids: [...pendingMatchedPids],
                 favorite_unavailable: cachedPage ? [] : [...pendingUnavailableByPid.values()],
+                favorite_deferred_pids: cachedPage ? [] : [...pendingDeferredPids],
                 telemetry: telemetry.delta(snapshot),
               });
               chunkStartPage = pageNumber + 1;
@@ -800,6 +902,7 @@ async (page) => {
               pendingRows = [];
               pendingMatchedPids = new Set();
               pendingUnavailableByPid = new Map();
+              pendingDeferredPids = new Set();
               telemetry.acknowledge(snapshot);
             }
             processingPages.delete(pageNumber);

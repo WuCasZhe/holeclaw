@@ -11,11 +11,13 @@ try:
     from holeclaw_cache import CacheStore
     from holeclaw_domain import CliError, SHANGHAI
     from holeclaw_sink import SinkServer
+    from holeclaw_search import search_rows
 except ModuleNotFoundError:
     from scripts.holeclaw_media import MediaStore
     from scripts.holeclaw_cache import CacheStore
     from scripts.holeclaw_domain import CliError, SHANGHAI
     from scripts.holeclaw_sink import SinkServer
+    from scripts.holeclaw_search import search_rows
 
 
 try:
@@ -114,9 +116,10 @@ def run_archive(args, services: CollectorServices | None = None):
             print(f"档案采集：{checkpoint['window_label']}，{filters}；"
                   f"请求并发上限 {args.concurrency}，"
                   f"复用列表缓存 {checkpoint.get('cached_posts', 0)} 帖，"
-                  f"每 {args.progress_pages} 个已提交列表页汇报一次，"
                   f"每 {args.cache_chunk_pages} 页批量写入列表缓存"
-                  + (f"，额外每 {args.progress_seconds} 秒汇报新进展" if args.progress_seconds else "")
+                  + (f"，每 {args.progress_pages} 个已提交列表页汇报新进展" if args.progress_pages else "")
+                  + (f"，每 {args.progress_seconds} 秒汇报新进展" if args.progress_seconds else "")
+                  + "，阶段结束时汇报剩余进展"
                   + "。", flush=True)
             browser = services.ensure_standalone_login(args)
             sink = ArchiveSink(cache, checkpoint, checkpoint_path, args.min_comments, args.min_favorites,
@@ -144,7 +147,7 @@ def run_archive(args, services: CollectorServices | None = None):
                                     checkpoint['total_scanned'], checkpoint['favorites_complete'])
         with cache.transaction():
             cache.connection.execute('DELETE FROM archive_candidates WHERE run_id=?', (checkpoint['created_at'],))
-        archive_totals = cache.summary()
+        archive_totals = cache.summary(verify=args.verify_cache)
         summary = dict(cache.window_summary(checkpoint, FilterSpec.from_args(args)),
                        archive_totals=archive_totals, cache_integrity=archive_totals['cache_integrity'],
                        start_timestamp=checkpoint['start_timestamp'], end_timestamp=checkpoint['end_timestamp'],
@@ -182,11 +185,7 @@ def search_archive(args):
             db.row_factory = sqlite3.Row
             if not db.execute("SELECT 1 FROM metadata WHERE key='archive_account'").fetchone():
                 raise CliError('This is not an archive database.')
-            rows = db.execute("""SELECT 'post' AS kind, pid, NULL AS cid, timestamp, text FROM posts
-                WHERE instr(text, ?) > 0
-                UNION ALL SELECT 'comment', pid, cid, timestamp, text FROM comments
-                WHERE instr(text, ?) > 0 ORDER BY timestamp DESC LIMIT ?""",
-                (args.query, args.query, args.limit)).fetchall()
+            rows = search_rows(db, args.query, args.limit)
             print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
     except sqlite3.Error as error:
         raise CliError(f'Cannot search archive: {error}') from error

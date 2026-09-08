@@ -9,7 +9,7 @@ const original = fs.readFileSync(path.join(__dirname, '../scripts/collect.js'), 
 
 async function simulate(name, options = {}) {
   const {pages = 8, matches = 1, replies = 169, concurrency = 8,
-    archive = true, limit10 = false, serialPages = false, longestFirst = false,
+    archive = true, limit10 = false, serialPages = false, listOrder = false,
     sinkMs = 2, missingFavorites = false, repeat = false, boundary = false} = options;
   let source = original;
   if (limit10) {
@@ -18,11 +18,10 @@ async function simulate(name, options = {}) {
     source = source.replace(needle, '&limit=${10}&sort=0');
   }
   if (serialPages) source = source.replace('(archive ? requestConcurrency : 1)', '1');
-  if (longestFirst) {
-    const needle = 'await Promise.all(pageMatches.map((post) => schedulePost';
+  if (listOrder) {
+    const needle = 'const workOrder = [...pageMatches].sort((a, b) => Math.min(b.reply, 1000) - Math.min(a.reply, 1000));';
     assert.equal(source.split(needle).length, 2);
-    source = source.replace(needle,
-      'await Promise.all([...pageMatches].sort((a, b) => b.reply - a.reply).map((post) => schedulePost');
+    source = source.replace(needle, 'const workOrder = pageMatches;');
   }
   let now = 0, serial = 0, active = 0, peak = 0, networkMs = 0;
   const timers = new Map(), counts = {list: 0, detail: 0, comment: 0, sink: 0};
@@ -98,7 +97,7 @@ async function simulate(name, options = {}) {
   };
   class ModelDate extends Date { static now() { return now; } }
   const context = vm.createContext({fetch, setTimeout: setTimer,
-    clearTimeout: id => timers.delete(id), AbortController, URL,
+    clearTimeout: id => timers.delete(id), AbortController, AbortSignal, URL,
     performance: {now: () => now}, Date: ModelDate,
     Math: Object.assign(Object.create(Math), {random: () => 0.5})});
   const collector = vm.runInContext(source, context);

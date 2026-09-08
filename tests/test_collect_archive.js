@@ -117,6 +117,46 @@ async function boundaryAwarePrefetch(longRange) {
   }
 }
 
+async function locallyReusedCandidates(cacheOnly) {
+  const requests = [];
+  const result = await runCollector({
+    config: {...config, archive_cached_pages: 2, archive_cache_only: cacheOnly,
+      max_pages: 3, checkpoint_pages: 100, cache_chunk_pages: 1},
+    sinkFetch: async (url, options) => {
+      const payload = JSON.parse(options.body);
+      if (payload.archive_source) return response(payload.page === 1
+        ? {ok: true, posts: [], source_count: 500, oldest: 160, reused: 500}
+        : {ok: true, posts: [{pid: 'pending', timestamp: 150, reply: 1, text: 'cached', observed_at: 1000}],
+           source_count: 2, oldest: 140, reused: 1});
+      if (payload.archive_prepare) {
+        assert.deepEqual(payload.posts.map(p => p.pid), ['pending']);
+        assert.equal(payload.posts[0].observed_at, 1000, 'cached observations must survive the browser roundtrip');
+        return response({ok: true, resumes: {pending: {next_page: 1, complete: false}}});
+      }
+      return response({ok: true});
+    },
+    remoteFetch: async url => {
+      const parsed = new URL(url, 'https://treehole.pku.edu.cn');
+      requests.push(parsed.pathname);
+      if (parsed.pathname.endsWith('/list_comments')) {
+        assert.equal(parsed.searchParams.get('page'), '1', 'local reuse must preserve network page offsets');
+        return response({code: 20000, data: {list: [{pid: 'boundary', timestamp: 99, reply: 0, text: 'old'}]}});
+      }
+      assert.ok(parsed.pathname.endsWith('/comment/list'));
+      assert.equal(parsed.searchParams.get('pid'), 'pending');
+      return response({code: 20000, data: {list: []}});
+    },
+  });
+  const chunks = result.sinkPayloads.filter(p => p.start_page);
+  assert.equal(chunks.length, cacheOnly ? 2 : 3, 'an empty filtered page must not end collection');
+  assert.equal(chunks[0].oldest, 160);
+  assert.equal(chunks[0].terminal, false);
+  assert.equal(chunks[1].oldest, 140, 'oldest date includes locally reused posts');
+  assert.equal(requests.length, cacheOnly ? 1 : 2);
+  assert.equal(result.sinkPayloads.filter(p => p.archive_prepare).length, 1);
+  assert.ok(chunks.at(-1).reached_start);
+}
+
 async function cappedComments(extractImages, savedCount = 0, pageLength = null) {
   const fetched = [];
   const saved = Array.from({length: savedCount}, (_, i) => String(i));
@@ -170,6 +210,8 @@ async function cappedComments(extractImages, savedCount = 0, pageLength = null) 
   await assert.rejects(collect('malformed'), /Invalid comment list/);
   await cachedAndFiltered(true);
   await cachedAndFiltered(false);
+  await locallyReusedCandidates(true);
+  await locallyReusedCandidates(false);
   await boundaryAwarePrefetch(false);
   await boundaryAwarePrefetch(true);
   console.log('archive collector tests: ok');

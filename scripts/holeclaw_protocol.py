@@ -14,6 +14,7 @@ ENVELOPE_VERSION = 3
 ARCHIVE_KINDS = (
     'archive_comments', 'archive_resume', 'archive_prepare', 'archive_source',
     'archive_post_media', 'archive_media_plan', 'archive_media_file', 'archive_media_unavailable',
+    'archive_post_unavailable',
 )
 KINDS = (*ARCHIVE_KINDS, 'list_chunk', 'telemetry_final')
 

@@ -99,8 +99,8 @@ def should_reuse_checkpoint(args: argparse.Namespace, checkpoint: dict) -> bool:
     return checkpoint.get("end_timestamp", requested_end) >= requested_end
 
 def validate_progress_arguments(args: argparse.Namespace) -> None:
-    if args.progress_pages < 1:
-        raise CliError('--progress-pages must be positive.')
+    if args.progress_pages < 0:
+        raise CliError('--progress-pages must be non-negative (0 disables page-based progress).')
     if args.progress_seconds != 0 and args.progress_seconds < 10:
         raise CliError('--progress-seconds must be 0 (disabled) or at least 10.')
 

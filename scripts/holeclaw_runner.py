@@ -163,7 +163,7 @@ def run_persistent_collector(
             )
             if (not getattr(args, "archive", False) and progress
                     and progress["pages"] > last_reported_pages
-                    and (progress["pages"] - last_reported_pages >= progress_step
+                    and ((progress_step and progress["pages"] - last_reported_pages >= progress_step)
                          or (args.progress_seconds and time.monotonic() - last_reported_at >= args.progress_seconds)
                          or sink.result() is not None)):
                 oldest = progress.get("oldest", 0)

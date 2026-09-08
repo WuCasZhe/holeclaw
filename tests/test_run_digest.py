@@ -53,12 +53,14 @@ class ThresholdTests(unittest.TestCase):
         run_digest.resolve_thresholds(args)
         self.assertEqual(run_digest.window_spec(args)["match_mode"], "any")
 
-    def test_cache_and_progress_default_to_one_page(self) -> None:
+    def test_cache_and_progress_defaults(self) -> None:
         for command in ('run', 'standalone', 'archive'):
             arguments = [command, '-a', 'test'] if command == 'archive' else [command]
             args = run_digest.build_parser().parse_args(arguments)
             self.assertEqual(args.cache_chunk_pages, 1)
-            self.assertEqual(args.progress_pages, 1)
+            self.assertEqual(args.progress_pages, 0 if command == 'archive' else 1)
+            self.assertEqual(args.progress_seconds, 300 if command == 'archive' else 0)
+            run_digest.validate_progress_arguments(args)
 
     def test_short_options_preserve_long_option_values(self):
         parser = run_digest.build_parser()
@@ -75,11 +77,12 @@ class ThresholdTests(unittest.TestCase):
         self.assertEqual(vars(short), vars(long))
 
     def test_progress_validation(self):
-        for option, value in [('-p', '0'), ('-p', '-1'), ('-t', '-1'), ('-t', '9')]:
+        for option, value in [('-p', '-1'), ('-t', '-1'), ('-t', '9')]:
             with self.subTest(option=option, value=value), self.assertRaises(run_digest.CliError):
                 run_digest.validate_progress_arguments(self.parse_run(option, value))
         run_digest.validate_progress_arguments(self.parse_run('-t', '0'))
         run_digest.validate_progress_arguments(self.parse_run('-t', '10'))
+        run_digest.validate_progress_arguments(self.parse_run('-p', '0', '-t', '300'))
 
     def test_request_concurrency_defaults_to_eight_and_is_configurable(self) -> None:
         for command in ('run', 'standalone', 'archive'):
