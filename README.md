@@ -40,6 +40,7 @@ cd holeclaw
 python3 scripts/run_digest.py --help
 ```
 ## 使用
+PS:默认8并发线程
 
 筛选热门帖子树洞号：
 ```bash
